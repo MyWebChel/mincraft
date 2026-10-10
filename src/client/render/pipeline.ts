@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { FullScreenQuad } from 'three/examples/jsm/postprocessing/Pass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import type { Environment } from './environment';
-import { LAYER_ENTITY, LAYER_TERRAIN, type SharedUniforms, type TerrainMaterials } from './materials';
+import { LAYER_CUTOUT, LAYER_ENTITY, LAYER_TERRAIN, type SharedUniforms, type TerrainMaterials } from './materials';
 import { FINAL_FRAGMENT, FINAL_VERTEX } from './shaders';
 
 export type QualityLevel = 'low' | 'medium' | 'high' | 'ultra';
@@ -46,26 +46,26 @@ export const QUALITY_PRESETS: Record<QualityLevel, QualitySettings> = {
     fancyLeaves: true,
     clouds: true,
     waving: true,
-    maxPixelRatio: 1.25,
+    maxPixelRatio: 1,
   },
   high: {
     level: 'high',
     shadowSize: 2048,
     shadowDistance: 48,
-    shadowTaps: 9,
+    shadowTaps: 8,
     bloom: true,
     godRays: true,
-    msaa: 4,
+    msaa: 2,
     fancyLeaves: true,
     clouds: true,
     waving: true,
-    maxPixelRatio: 1.5,
+    maxPixelRatio: 1.25,
   },
   ultra: {
     level: 'ultra',
     shadowSize: 4096,
     shadowDistance: 72,
-    shadowTaps: 16,
+    shadowTaps: 12,
     bloom: true,
     godRays: true,
     msaa: 4,
@@ -97,9 +97,14 @@ export class Pipeline {
   private bloom: UnrealBloomPass | null = null;
   private readonly finalQuad: FullScreenQuad;
   private readonly finalMaterial: THREE.ShaderMaterial;
-  private readonly entityDepth = new THREE.MeshDepthMaterial();
+  /** Материал сущностей в проходе теней. */
+  readonly entityDepth = new THREE.MeshDepthMaterial();
   private width = 1;
   private height = 1;
+  /** Доля разрешения (0.5..1): понижается автоматически, если видеокарта не успевает. */
+  private renderScale = 1;
+  /** Вызывается перед каждым проходом (кадр или тени) — здесь чанки отсекаются под его камеру. */
+  onPass: (camera: THREE.Camera, shadow: boolean) => void = () => {};
   /** Сила красной виньетки при получении урона (0..1). */
   damageFlash = 0;
   exposure = 1.0;
@@ -114,8 +119,11 @@ export class Pipeline {
     this.renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance', stencil: false });
     this.renderer.autoClear = false;
     this.renderer.info.autoReset = false;
+    // Проверка ошибок шейдеров ждёт окончания компиляции синхронно — в собранной игре она не нужна.
+    this.renderer.debug.checkShaderErrors = import.meta.env.DEV;
     container.prepend(this.renderer.domElement);
     this.camera.layers.enable(LAYER_TERRAIN);
+    this.camera.layers.enable(LAYER_CUTOUT);
     this.camera.layers.enable(LAYER_ENTITY);
 
     this.finalMaterial = new THREE.ShaderMaterial({
@@ -144,9 +152,26 @@ export class Pipeline {
     return this.renderer.extensions.has('EXT_color_buffer_half_float') || this.renderer.extensions.has('EXT_color_buffer_float');
   }
 
+  get scale(): number {
+    return this.renderScale;
+  }
+
+  /** Меняет долю разрешения (динамическое разрешение). */
+  setRenderScale(scale: number): void {
+    const s = Math.max(0.5, Math.min(1, scale));
+    if (Math.abs(s - this.renderScale) < 0.01) return;
+    this.renderScale = s;
+    this.applyPixelRatio();
+    this.resize(this.width, this.height, true);
+  }
+
+  private applyPixelRatio(): void {
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, this.quality.maxPixelRatio) * this.renderScale);
+  }
+
   setQuality(q: QualitySettings): void {
     this.quality = q;
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, q.maxPixelRatio));
+    this.applyPixelRatio();
     this.finalMaterial.defines = q.godRays ? { GOD_RAYS: 1 } : {};
     this.finalMaterial.needsUpdate = true;
 
@@ -154,6 +179,9 @@ export class Pipeline {
     this.shadowRT = null;
     if (q.shadowSize > 0) {
       const depthTexture = new THREE.DepthTexture(q.shadowSize, q.shadowSize);
+      // Аппаратное сравнение глубины со сглаживанием (sampler2DShadow в шейдере).
+      depthTexture.compareFunction = THREE.LessEqualCompare;
+      depthTexture.minFilter = depthTexture.magFilter = THREE.LinearFilter;
       this.shadowRT = new THREE.WebGLRenderTarget(q.shadowSize, q.shadowSize, { depthTexture, depthBuffer: true });
       this.uniforms.uShadowMap.value = depthTexture;
       this.uniforms.uShadowTexel.value = 1 / q.shadowSize;
@@ -187,6 +215,42 @@ export class Pipeline {
     this.bloom = this.quality.bloom ? new UnrealBloomPass(new THREE.Vector2(w / 2, h / 2), 0.32, 0.55, 1.05) : null;
   }
 
+  /**
+   * Заранее компилирует в фоне шейдеры образцов (мобы, предметы...), чтобы первый моб
+   * или выпавший предмет не «подвешивал» игру, а потом готовит и всё, что уже есть в сценах
+   * (частицы, дождь, рамка выделения). Освещение берётся из сцены, рендер-таргет — сцены:
+   * от них зависит вариант шейдера. Образцы не должны удаляться, пока идёт фоновая проверка.
+   */
+  precompile(samples: THREE.Object3D): Promise<void> {
+    const r = this.renderer;
+    const onSceneTarget = <T>(fn: () => T): T => {
+      const prev = r.getRenderTarget();
+      r.setRenderTarget(this.sceneRT);
+      try {
+        return fn();
+      } finally {
+        r.setRenderTarget(prev);
+      }
+    };
+    // Готовые программы сразу опрашиваем (uniform-ы, атрибуты): этот синхронный запрос
+    // к видеокарте иначе случился бы посреди игры, при первом появлении объекта.
+    const touch = (o: THREE.Object3D) => {
+      const material = (o as THREE.Mesh).material;
+      for (const m of Array.isArray(material) ? material : material ? [material] : []) {
+        const props = r.properties.get(m) as { currentProgram?: { getUniforms(): unknown } };
+        props.currentProgram?.getUniforms();
+      }
+    };
+    return onSceneTarget(() => r.compileAsync(samples, this.camera, this.scene)).then(() => {
+      onSceneTarget(() => {
+        r.compile(this.scene, this.camera);
+        r.compile(this.handScene, this.handCamera);
+      });
+      this.scene.traverse(touch);
+      this.handScene.traverse(touch);
+    });
+  }
+
   /** Тени: ортографическая камера со стороны солнца, привязанная к сетке текселей. */
   private renderShadows(materials: TerrainMaterials, center: THREE.Vector3): void {
     if (!this.shadowRT) return;
@@ -197,10 +261,13 @@ export class Pipeline {
     cam.right = d;
     cam.top = d;
     cam.bottom = -d;
+    // Глубина — сколько блоков в сторону солнца собираем тех, кто отбрасывает тень. При низком
+    // солнце больше 400 блоков по лучу — это десятки лишних чанков в карте теней.
+    const depth = d + 48;
     cam.near = 1;
-    cam.far = 400;
+    cam.far = depth * 2;
     const lightDir = this.uniforms.uLightDir.value;
-    cam.position.copy(center).addScaledVector(lightDir, 200);
+    cam.position.copy(center).addScaledVector(lightDir, depth);
     cam.up.set(0, 0, 1);
     cam.lookAt(center);
     cam.updateMatrixWorld();
@@ -217,10 +284,14 @@ export class Pipeline {
     this.uniforms.uShadowMatrix.value.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
 
     const r = this.renderer;
+    this.onPass(cam, true);
     r.setRenderTarget(this.shadowRT);
     r.clear(true, true, false);
     cam.layers.set(LAYER_TERRAIN);
-    this.scene.overrideMaterial = materials.shadowDepth;
+    this.scene.overrideMaterial = materials.shadowOpaque;
+    r.render(this.scene, cam);
+    cam.layers.set(LAYER_CUTOUT);
+    this.scene.overrideMaterial = materials.shadowCutout;
     r.render(this.scene, cam);
     cam.layers.set(LAYER_ENTITY);
     this.scene.overrideMaterial = this.entityDepth;
@@ -233,6 +304,7 @@ export class Pipeline {
     r.info.reset();
     if (this.shadowRT && this.uniforms.uLightColor.value.lengthSq() > 0.0001) this.renderShadows(materials, shadowCenter);
 
+    this.onPass(this.camera, false);
     r.setRenderTarget(this.sceneRT);
     r.setClearColor(0x000000, 1);
     r.clear(true, true, false);

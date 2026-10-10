@@ -23,6 +23,8 @@ const CLOUD_GRID = 64;
 const CLOUD_TILE = CLOUD_CELL * CLOUD_GRID;
 const CLOUD_Y = 118;
 const CLOUD_THICKNESS = 4;
+/** Не больше 3×3 плиток узора облаков одновременно. */
+const CLOUD_INSTANCES = 9;
 
 /** Небо, время суток, облака: считает цвета атмосферы и обновляет uniform-ы. */
 export class Environment {
@@ -38,6 +40,7 @@ export class Environment {
   private clouds: THREE.InstancedMesh | null = null;
   private cloudPrepass: THREE.InstancedMesh | null = null;
   private cloudDrift = 0;
+  private cloudTiles = '';
 
   constructor(
     private readonly scene: THREE.Scene,
@@ -132,10 +135,32 @@ export class Environment {
 
     if (this.clouds && this.cloudPrepass) {
       this.cloudDrift += dt * 0.8;
-      const ox = Math.floor((camera.position.x - this.cloudDrift) / CLOUD_TILE) * CLOUD_TILE + this.cloudDrift;
-      const oz = Math.floor(camera.position.z / CLOUD_TILE) * CLOUD_TILE;
-      this.clouds.position.set(ox, CLOUD_Y, oz);
+      this.clouds.position.set(this.cloudDrift, CLOUD_Y, 0);
       this.cloudPrepass.position.copy(this.clouds.position);
+      // Рисуем только плитки узора, которые не скрыты туманом (обычно 1–4 из 9).
+      const range = u.uFogFar.value * 3.2;
+      const cx = camera.position.x - this.cloudDrift;
+      const cz = camera.position.z;
+      const x0 = Math.floor((cx - range) / CLOUD_TILE);
+      const x1 = Math.floor((cx + range) / CLOUD_TILE);
+      const z0 = Math.floor((cz - range) / CLOUD_TILE);
+      const z1 = Math.floor((cz + range) / CLOUD_TILE);
+      const key = `${x0},${x1},${z0},${z1}`;
+      if (key !== this.cloudTiles) {
+        this.cloudTiles = key;
+        const m = new THREE.Matrix4();
+        let n = 0;
+        for (let tz = z0; tz <= z1; tz++)
+          for (let tx = x0; tx <= x1 && n < CLOUD_INSTANCES; tx++, n++) {
+            m.makeTranslation(tx * CLOUD_TILE, 0, tz * CLOUD_TILE);
+            this.clouds.setMatrixAt(n, m);
+            this.cloudPrepass.setMatrixAt(n, m);
+          }
+        for (const mesh of [this.clouds, this.cloudPrepass]) {
+          mesh.count = n;
+          mesh.instanceMatrix.needsUpdate = true;
+        }
+      }
     }
   }
 
@@ -194,10 +219,9 @@ export class Environment {
       colorWrite: false,
     });
     const makeInstanced = (m: THREE.Material) => {
-      const mesh = new THREE.InstancedMesh(geometry, m, 9);
-      let k = 0;
-      const mat = new THREE.Matrix4();
-      for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) mesh.setMatrixAt(k++, mat.makeTranslation(i * CLOUD_TILE, 0, j * CLOUD_TILE));
+      // Какие плитки узора рисовать, решает update().
+      const mesh = new THREE.InstancedMesh(geometry, m, CLOUD_INSTANCES);
+      mesh.count = 0;
       mesh.frustumCulled = false;
       return mesh;
     };
@@ -206,5 +230,6 @@ export class Environment {
     this.clouds = makeInstanced(material);
     this.clouds.renderOrder = 2;
     this.scene.add(this.cloudPrepass, this.clouds);
+    this.cloudTiles = '';
   }
 }

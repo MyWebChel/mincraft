@@ -73,7 +73,8 @@ function extrudeSprite(tile: Tile): THREE.BufferGeometry {
 }
 
 export class ItemMeshes {
-  private readonly blockGeo = new Map<number, { solid: THREE.BufferGeometry | null; translucent: THREE.BufferGeometry | null }>();
+  /** Геометрия блоков-предметов по состоянию блока: по одной на слой (непрозрачный, «дырявый», полупрозрачный). */
+  private readonly blockGeo = new Map<number, THREE.BufferGeometry[]>();
   private readonly spriteGeo = new Map<string, THREE.BufferGeometry>();
 
   constructor(
@@ -109,15 +110,14 @@ export class ItemMeshes {
       const s = state ?? itemDef(id)?.places ?? makeState(id);
       let g = this.blockGeo.get(s);
       if (!g) {
-        const { solid, translucent } = meshSingleBlock(s);
-        g = { solid: solid && geometryFromMeshData(solid), translucent: translucent && geometryFromMeshData(translucent) };
+        const m = meshSingleBlock(s);
+        g = [m.opaque, m.cutout, m.translucent].filter((md): md is MeshData => !!md).map(geometryFromMeshData);
         this.blockGeo.set(s, g);
       }
       const inner = new THREE.Group();
       // Геометрия блока лежит в клетке (0, 1, 0) — центрируем.
       inner.position.set(-0.5, -1.5, -0.5);
-      for (const geo of [g.solid, g.translucent]) {
-        if (!geo) continue;
+      for (const geo of g) {
         const mat = this.materials.entityBlock(light, hand);
         disposables.push(mat);
         const mesh = new THREE.Mesh(geo, mat);

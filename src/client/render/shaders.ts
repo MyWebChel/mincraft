@@ -53,7 +53,7 @@ vec3 applyFog(vec3 col, vec3 world) {
 
 export const SHADOW_FUNCTIONS = /* glsl */ `
 #ifdef USE_SHADOWS
-uniform sampler2D uShadowMap;
+uniform highp sampler2DShadow uShadowMap;
 uniform mat4 uShadowMatrix;
 uniform float uShadowTexel;
 const vec2 POISSON[16] = vec2[16](
@@ -67,12 +67,10 @@ float shadowFactor(vec3 world, vec3 normal, float ndl) {
   vec4 sc = uShadowMatrix * vec4(p, 1.0);
   vec3 c = sc.xyz * 0.5 + 0.5;
   if (c.x <= 0.0 || c.x >= 1.0 || c.y <= 0.0 || c.y >= 1.0 || c.z >= 1.0) return 1.0;
-  float bias = 0.00025 + 0.0006 * (1.0 - ndl);
+  float ref = c.z - (0.00025 + 0.0006 * (1.0 - ndl));
+  // Сравнение глубины делает видеокарта и сразу сглаживает его по четырём текселям.
   float sum = 0.0;
-  for (int i = 0; i < SHADOW_TAPS; i++) {
-    float d = texture(uShadowMap, c.xy + POISSON[i] * uShadowTexel * 1.6).r;
-    sum += c.z - bias > d ? 0.0 : 1.0;
-  }
+  for (int i = 0; i < SHADOW_TAPS; i++) sum += texture(uShadowMap, vec3(c.xy + POISSON[i] * uShadowTexel * 1.6, ref));
   float s = sum / float(SHADOW_TAPS);
   vec2 e = abs(c.xy - 0.5) * 2.0;
   return mix(s, 1.0, smoothstep(0.82, 0.98, max(e.x, e.y)));
@@ -231,7 +229,9 @@ ${SAMPLE_ATLAS}
 
 void main() {
   vec4 tex = sampleAtlas(vUv, vAnim, vFace);
+#ifdef ALPHA_TEST
   if (tex.a < 0.5) discard;
+#endif
   vec3 albedo = tex.rgb;
   vec3 n = NORMALS_F[vFace];
 
@@ -365,7 +365,9 @@ uniform sampler2DArray uAtlas;
 in vec3 vUv;
 out vec4 outColor;
 void main() {
+#ifdef ALPHA_TEST
   if (texture(uAtlas, vUv).a < 0.5) discard;
+#endif
   outColor = vec4(1.0);
 }
 `;
@@ -501,18 +503,21 @@ void main() {
   vec3 col = texture2D(tColor, uv).rgb;
 #ifdef GOD_RAYS
   if (uSunVisible > 0.0) {
-    vec2 delta = (uSunScreen - uv) / 40.0;
-    vec2 p = uv;
+    // 24 шага со случайным сдвигом на пиксель выглядят как 40 ровных и вдвое дешевле.
+    const int STEPS = 24;
+    vec2 delta = (uSunScreen - uv) / float(STEPS);
+    float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+    vec2 p = uv + delta * jitter;
     float acc = 0.0;
     float w = 1.0;
-    for (int i = 0; i < 40; i++) {
+    for (int i = 0; i < STEPS; i++) {
       p += delta;
       float d = texture2D(tDepth, clamp(p, 0.0, 1.0)).r;
       acc += (d >= 0.99999 ? 1.0 : 0.0) * w;
-      w *= 0.965;
+      w *= 0.942;
     }
     float fall = 1.0 - smoothstep(0.0, 0.9, length((uv - uSunScreen) * vec2(1.0, 0.6)));
-    col += uRayColor * acc / 40.0 * uSunVisible * fall * 0.9;
+    col += uRayColor * acc / float(STEPS) * uSunVisible * fall * 0.9;
   }
 #endif
   col *= uExposure;

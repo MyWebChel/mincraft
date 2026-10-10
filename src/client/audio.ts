@@ -1,9 +1,9 @@
 /**
  * Звуковой движок. Аудиофайлов нет: каждый звук синтезируется процедурно.
  *
- * Звук один раз (лениво, в свободное время после unlock) рендерится в несколько вариаций —
- * Float32Array заполняется напрямую и синхронно, — а play() лишь запускает AudioBufferSourceNode
- * со случайным сдвигом высоты, поэтому вызывать его можно хоть каждый кадр.
+ * Звук один раз рендерится в несколько вариаций — в веб-воркере (SynthQueue), чтобы синтез
+ * не отнимал время у кадров, — а play() лишь запускает AudioBufferSourceNode со случайным
+ * сдвигом высоты, поэтому вызывать его можно хоть каждый кадр.
  *
  * Граф Web Audio:
  *   голоса: BufferSource → Gain → [Panner] ─┐
@@ -1894,13 +1894,11 @@ function pianoNote(midi: number, sr: number): Float32Array {
 }
 
 /** Импульсная характеристика зала: стерео-шум с экспоненциальным спадом и темнеющим хвостом. */
-function reverbImpulse(ctx: BaseAudioContext, sec: number, rt60: number): AudioBuffer {
-  const sr = ctx.sampleRate;
+function reverbChannels(sr: number, sec: number, rt60: number): Float32Array[] {
   const n = Math.round(sec * sr);
-  const buf = ctx.createBuffer(2, n, sr);
   const pre = Math.round(0.018 * sr);
-  for (let ch = 0; ch < 2; ch++) {
-    const d = buf.getChannelData(ch);
+  return [0, 1].map((ch) => {
+    const d = new Float32Array(n);
     const r = mulberry32(0xbeef + ch);
     let lp = 0;
     for (let i = pre; i < n; i++) {
@@ -1908,8 +1906,8 @@ function reverbImpulse(ctx: BaseAudioContext, sec: number, rt60: number): AudioB
       lp += (0.08 + 0.55 * Math.exp(-t / 0.9)) * (r() * 2 - 1 - lp);
       d[i] = lp * Math.exp((-6.9 * t) / rt60) * Math.min(1, (n - i) / (0.05 * sr));
     }
-  }
-  return buf;
+    return d;
+  });
 }
 
 /**
@@ -1933,6 +1931,7 @@ class Music {
   constructor(
     private readonly ctx: AudioContext,
     private readonly dest: AudioNode,
+    private readonly synth: SynthQueue,
   ) {
     this.sampleRate = Math.max(22050, Math.min(24000, ctx.sampleRate));
     this.out = ctx.createGain();
@@ -1943,7 +1942,9 @@ class Music {
     const send = ctx.createGain();
     send.gain.value = 0.55;
     const verb = ctx.createConvolver();
-    verb.buffer = reverbImpulse(ctx, 4, 3.2);
+    // Отклик зала считается в фоне; до тех пор музыка звучит без реверба.
+    const sr = ctx.sampleRate;
+    synth.request(`reverb:${sr}`, { kind: 'reverb', rate: sr, sec: 4, rt60: 3.2 }, false, (ch) => (verb.buffer = toBuffer(ctx, ch, sr)));
     this.bus.connect(dry);
     dry.connect(this.out);
     this.bus.connect(send);
@@ -1971,19 +1972,8 @@ class Music {
     this.out.connect(this.dest);
     this.nextPhrase = now + 3 + Math.random() * 4;
     if (this.timer === undefined) this.timer = setInterval(this.tick, 250);
-    // «Сэмплы» пианино готовим заранее, по одному в свободное время, — первая фраза не дёрнет кадр.
-    const queue = PIANO_BASES.filter((b) => !this.samples.has(b));
-    const next = () => {
-      const base = queue.shift();
-      if (base === undefined || !this.playing) return;
-      try {
-        this.sample(base);
-      } catch {
-        return;
-      }
-      whenIdle(next, 1000);
-    };
-    whenIdle(next, 1000);
+    // «Сэмплы» пианино готовим заранее, в фоне, — к первой фразе они уже есть.
+    for (const base of PIANO_BASES) this.sample(base);
   }
 
   private stop(): void {
@@ -2110,13 +2100,13 @@ class Music {
     return end + 6;
   }
 
-  private sample(base: number): AudioBuffer {
-    let b = this.samples.get(base);
-    if (!b) {
-      b = toBuffer(this.ctx, [pianoNote(base, this.sampleRate)], this.sampleRate);
-      this.samples.set(base, b);
-    }
-    return b;
+  /** Готовый «сэмпл» пианино; если его ещё нет — заказывает и возвращает undefined. */
+  private sample(base: number): AudioBuffer | undefined {
+    const b = this.samples.get(base);
+    if (b) return b;
+    const sr = this.sampleRate;
+    this.synth.request(`piano:${base}:${sr}`, { kind: 'piano', midi: base, rate: sr }, false, (ch) => this.samples.set(base, toBuffer(this.ctx, ch, sr)));
+    return undefined;
   }
 
   private track(src: AudioScheduledSourceNode, extra: AudioNode[]): void {
@@ -2132,8 +2122,10 @@ class Music {
     const ctx = this.ctx;
     let base = PIANO_BASES[0];
     for (const b of PIANO_BASES) if (Math.abs(b - midi) < Math.abs(base - midi)) base = b;
+    const buffer = this.sample(base);
+    if (!buffer) return;
     const src = ctx.createBufferSource();
-    src.buffer = this.sample(base);
+    src.buffer = buffer;
     src.playbackRate.value = Math.pow(2, (midi - base) / 12);
     const g = ctx.createGain();
     g.gain.value = vel;
@@ -2174,6 +2166,125 @@ class Music {
   }
 }
 
+// ---------- Фоновый синтез ----------
+
+/** Что синтезировать: звук, петли дождя, «сэмпл» пианино или отклик зала — чистые вычисления. */
+export type SynthJob =
+  | { kind: 'sound'; name: SoundName; variant: number; rate: number }
+  | { kind: 'rain'; rate: number }
+  | { kind: 'piano'; midi: number; rate: number }
+  | { kind: 'reverb'; rate: number; sec: number; rt60: number };
+
+/** Каналы результата (для дождя — подложка L/R и капли L/R). Вызывается в воркере синтеза. */
+export function renderJob(job: SynthJob): Float32Array[] {
+  switch (job.kind) {
+    case 'sound':
+      return [renderSound(job.name, job.variant, job.rate)];
+    case 'rain':
+      return [...rainBed(job.rate, 4), ...rainDrops(job.rate, 2.7)];
+    case 'piano':
+      return [pianoNote(job.midi, job.rate)];
+    case 'reverb':
+      return reverbChannels(job.rate, job.sec, job.rt60);
+  }
+}
+
+/**
+ * Очередь синтеза в веб-воркере: главный поток на звуки времени не тратит. Воркеру
+ * отдаётся по одному заданию, поэтому срочное (звук нужен прямо сейчас) обгоняет прогрев.
+ * Если воркер не запустился, синтезируем в свободное время главного потока.
+ */
+export class SynthQueue {
+  private worker: Worker | null = null;
+  private readonly pending = new Map<string, { job: SynthJob; done: ((channels: Float32Array[]) => void)[] }>();
+  private readonly order: string[] = [];
+  private busy: string | null = null;
+  private disposed = false;
+
+  constructor(createWorker?: () => Worker) {
+    try {
+      const worker = createWorker?.() ?? null;
+      if (worker) {
+        worker.onmessage = (e: MessageEvent<{ key: string; channels: Float32Array[] }>) => this.finish(e.data.key, e.data.channels);
+        worker.onerror = () => this.fallback();
+      }
+      this.worker = worker;
+    } catch {
+      this.worker = null;
+    }
+  }
+
+  request(key: string, job: SynthJob, urgent: boolean, done: (channels: Float32Array[]) => void): void {
+    if (this.disposed) return;
+    const p = this.pending.get(key);
+    if (p) {
+      p.done.push(done);
+      const i = this.order.indexOf(key);
+      if (urgent && i > 0) this.order.unshift(...this.order.splice(i, 1));
+      return;
+    }
+    this.pending.set(key, { job, done: [done] });
+    if (urgent) this.order.unshift(key);
+    else this.order.push(key);
+    this.next();
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.worker?.terminate();
+    this.worker = null;
+    this.pending.clear();
+    this.order.length = 0;
+  }
+
+  private next(): void {
+    if (this.busy !== null || this.disposed) return;
+    const key = this.order.shift();
+    if (key === undefined) return;
+    const p = this.pending.get(key);
+    if (!p) return this.next();
+    this.busy = key;
+    if (this.worker) {
+      this.worker.postMessage({ key, job: p.job });
+      return;
+    }
+    whenIdle(() => {
+      let channels: Float32Array[] = [];
+      try {
+        channels = renderJob(p.job);
+      } catch {
+        // звук не получился — просто не будет звучать
+      }
+      this.finish(key, channels);
+    });
+  }
+
+  /** Воркер не загрузился: текущее задание возвращаем в очередь и синтезируем сами. */
+  private fallback(): void {
+    this.worker?.terminate();
+    this.worker = null;
+    if (this.busy !== null) this.order.unshift(this.busy);
+    this.busy = null;
+    this.next();
+  }
+
+  private finish(key: string, channels: Float32Array[]): void {
+    if (this.busy === key) this.busy = null;
+    const p = this.pending.get(key);
+    this.pending.delete(key);
+    if (p && channels.length && !this.disposed) {
+      for (const done of p.done) {
+        try {
+          done(channels);
+        } catch {
+          // ignore
+        }
+      }
+    }
+    this.next();
+  }
+}
+
 // ---------- Движок ----------
 
 interface Voice {
@@ -2189,6 +2300,7 @@ interface Voice {
 
 export class SoundEngine {
   private ctx: AudioContext | null = null;
+  private synth: SynthQueue | null = null;
   private unavailable = false;
   private disposed = false;
   private rate = MAX_RATE;
@@ -2204,12 +2316,15 @@ export class SoundEngine {
   private readonly lastVariant = new Map<SoundName, number>();
   private voices: Voice[] = [];
   private fadingUntil: number[] = [];
-  private warm: (() => void)[] | null = null;
+  private warm = false;
   private volume = 1;
   private musicVolume = 0;
   private rainLevel = 0;
   private underwater = false;
   private readonly pos = { x: 0, y: 0, z: 0, yaw: 0, pitch: 0 };
+
+  /** createWorker — фабрика воркера синтеза (см. synth.worker.ts); без неё звуки синтезируются в главном потоке. */
+  constructor(private readonly createWorker?: () => Worker) {}
 
   /** Вызывать из обработчика жеста (клик, касание, клавиша): создаёт или возобновляет AudioContext. Можно вызывать сколько угодно раз. */
   unlock(): void {
@@ -2247,7 +2362,7 @@ export class SoundEngine {
     this.musicVolume = clamp(num(v, this.musicVolume), 0, 1);
     try {
       if (!this.ctx || !this.master) return;
-      if (!this.music && this.musicVolume > 0) this.music = new Music(this.ctx, this.master);
+      if (!this.music && this.musicVolume > 0 && this.synth) this.music = new Music(this.ctx, this.master, this.synth);
       this.music?.setVolume(this.musicVolume);
     } catch {
       // ignore
@@ -2363,7 +2478,7 @@ export class SoundEngine {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.warm = null;
+    this.synth?.dispose();
     clearTimeout(this.rainTimer);
     try {
       this.music?.dispose();
@@ -2406,6 +2521,7 @@ export class SoundEngine {
     }
     this.ctx = ctx;
     this.rate = Math.min(MAX_RATE, ctx.sampleRate);
+    this.synth = new SynthQueue(this.createWorker);
     // Компрессор с высоким порогом — страховка от клиппинга, когда звуков много.
     const comp = ctx.createDynamicsCompressor();
     comp.threshold.value = -8;
@@ -2497,7 +2613,10 @@ export class SoundEngine {
     if (!ctx || !this.sfxIn) return;
     const level = this.rainLevel;
     clearTimeout(this.rainTimer);
-    if (level > 0 && !this.rain) this.rain = new RainLoop(ctx, this.sfxIn, this.rainLoops(ctx));
+    if (level > 0 && !this.rain) {
+      const loops = this.rainLoops(ctx);
+      if (loops) this.rain = new RainLoop(ctx, this.sfxIn, loops);
+    }
     if (!this.rain) return;
     this.rain.set(level, ctx.currentTime);
     // Когда дождь стих, останавливаем петли, чтобы не тратить процессор.
@@ -2511,74 +2630,59 @@ export class SoundEngine {
     }
   }
 
-  private rainLoops(ctx: AudioContext): AudioBuffer[] {
-    this.rainBuffers ??= [
-      toBuffer(ctx, rainBed(this.rate, 4), this.rate),
-      toBuffer(ctx, rainDrops(this.rate, 2.7), this.rate),
-    ];
-    return this.rainBuffers;
+  /** Петли дождя; пока они синтезируются — null (дождь зазвучит чуть позже). */
+  private rainLoops(ctx: AudioContext): AudioBuffer[] | null {
+    if (this.rainBuffers) return this.rainBuffers;
+    const sr = this.rate;
+    this.synth?.request(`rain:${sr}`, { kind: 'rain', rate: sr }, true, (ch) => {
+      this.rainBuffers = [toBuffer(ctx, ch.slice(0, 2), sr), toBuffer(ctx, ch.slice(2, 4), sr)];
+      this.applyRain();
+    });
+    return null;
   }
 
-  /** Возвращает готовую вариацию звука (не ту же, что в прошлый раз); если готовых нет — рендерит первую сразу. */
+  /** Готовая вариация звука (не та же, что в прошлый раз); если готовых нет — заказывает первую и молчит. */
   private pick(name: SoundName): AudioBuffer | undefined {
     const list = this.buffers.get(name);
     const ready: number[] = [];
     if (list) for (let i = 0; i < list.length; i++) if (list[i]) ready.push(i);
-    if (!list || !ready.length) return this.variant(name, 0);
+    if (!ready.length) {
+      this.variant(name, 0, true);
+      return undefined;
+    }
     let k = Math.floor(Math.random() * ready.length);
     if (ready.length > 1 && ready[k] === this.lastVariant.get(name)) k = (k + 1) % ready.length;
     this.lastVariant.set(name, ready[k]);
-    return list[ready[k]];
+    return list![ready[k]];
   }
 
-  private variant(name: SoundName, v: number): AudioBuffer | undefined {
+  /** Заказывает вариацию звука у очереди синтеза (если её ещё нет). */
+  private variant(name: SoundName, v: number, urgent: boolean): void {
     const ctx = this.ctx;
-    if (!ctx) return undefined;
-    let list = this.buffers.get(name);
-    if (!list) {
-      list = [];
-      this.buffers.set(name, list);
-    }
-    let b = list[v];
-    if (!b) {
-      const rate = soundRate(name, this.rate);
-      b = toBuffer(ctx, [renderSound(name, v, rate)], rate);
-      list[v] = b;
-    }
-    return b;
+    const synth = this.synth;
+    if (!ctx || !synth || this.buffers.get(name)?.[v]) return;
+    const rate = soundRate(name, this.rate);
+    synth.request(`${name}#${v}:${rate}`, { kind: 'sound', name, variant: v, rate }, urgent, ([data]) => {
+      let list = this.buffers.get(name);
+      if (!list) this.buffers.set(name, (list = []));
+      list[v] = toBuffer(ctx, [data], rate);
+    });
   }
 
   /**
-   * После запуска понемногу, в свободное время, рендерит все вариации всех звуков (сначала по одной
-   * каждого, потом остальные) и петли дождя — чтобы потом ничего не синтезировалось посреди игры.
+   * После запуска заказывает в фоне все вариации всех звуков (сначала по одной каждого,
+   * потом остальные) и петли дождя — чтобы потом ничего не синтезировалось посреди игры.
    */
   private warmUp(): void {
     const ctx = this.ctx;
     if (this.warm || this.disposed || ctx?.state !== 'running') return;
-    const list: (() => void)[] = [];
-    for (let v = 0; v < 4; v++) {
-      for (const name of SOUND_NAMES) if (v < DEFS[name].vars) list.push(() => this.variant(name, v));
-    }
-    list.push(() => this.rainLoops(ctx));
-    this.warm = list;
-    whenIdle(this.warmStep);
+    this.warm = true;
+    for (let v = 0; v < 4; v++) for (const name of SOUND_NAMES) if (v < DEFS[name].vars) this.variant(name, v, false);
+    const sr = this.rate;
+    this.synth?.request(`rain:${sr}`, { kind: 'rain', rate: sr }, false, (ch) => {
+      this.rainBuffers ??= [toBuffer(ctx, ch.slice(0, 2), sr), toBuffer(ctx, ch.slice(2, 4), sr)];
+    });
   }
-
-  private readonly warmStep = (deadline?: IdleDeadline): void => {
-    const list = this.warm;
-    if (!list || this.disposed || !this.ctx) return;
-    const t0 = performance.now();
-    try {
-      while (list.length) {
-        list.shift()!();
-        const left = deadline && !deadline.didTimeout ? deadline.timeRemaining() : 6 - (performance.now() - t0);
-        if (left < 3) break;
-      }
-    } catch {
-      list.length = 0;
-    }
-    if (list.length) whenIdle(this.warmStep);
-  };
 
   /** Освобождает место для нового голоса, вытесняя самый тихий (с учётом того, сколько ему осталось). */
   private steal(level: number, now: number): boolean {

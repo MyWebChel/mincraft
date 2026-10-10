@@ -5,12 +5,13 @@ import { breakTime } from '../shared/drops';
 import { stack, type ItemStack } from '../shared/inventory';
 import { Item, itemDef } from '../shared/items';
 import { bodyIntersectsBlock } from '../shared/physics';
-import type { GameMode, PlayerInfo, ServerMessage, Vec3 } from '../shared/protocol';
+import { MOB_NAMES, type GameMode, type MobType, type PlayerInfo, type ServerMessage, type Vec3 } from '../shared/protocol';
 import { selectionBoxes } from '../shared/shapes';
 import { Biome, SNOW_LINE, WorldGenerator } from '../shared/worldgen';
 import { SoundEngine, type SoundName } from './audio';
 import { Avatar } from './avatars';
 import { EntityRenderer } from './entities';
+import { createMobModel } from './mobModels';
 import { Input, isTouchDevice } from './input';
 import { PlayerInventory } from './inventory';
 import { InventoryUI } from './inventoryUI';
@@ -21,7 +22,7 @@ import { raycastBlocks, raycastFluid, type RayHit } from './raycast';
 import { Environment } from './render/environment';
 import { FirstPersonHand } from './render/hand';
 import { ItemMeshes } from './render/items3d';
-import { createAtlasTexture, createSharedUniforms, createTerrainMaterials, type TerrainMaterials } from './render/materials';
+import { applyEntityLight, createAtlasTexture, createSharedUniforms, createTerrainMaterials, type TerrainMaterials } from './render/materials';
 import { BlockOverlays, Rain } from './render/overlays';
 import { Particles } from './render/particles';
 import { Pipeline, QUALITY_NAMES, QUALITY_PRESETS, type QualityLevel, type QualitySettings } from './render/pipeline';
@@ -84,7 +85,7 @@ export class Game {
   private readonly overlays: BlockOverlays;
   private readonly rainFx: Rain;
   private readonly hand: FirstPersonHand;
-  private readonly sound = new SoundEngine();
+  private readonly sound = new SoundEngine(() => new Worker(new URL('./synth.worker.ts', import.meta.url), { type: 'module' }));
   private readonly input: Input;
   private readonly avatars = new Map<number, Avatar>();
   private readonly colors = new Map<number, string>();
@@ -129,11 +130,13 @@ export class Game {
   private lastHp = 20;
   private elapsed = 0;
   private readonly entityLight = new THREE.Vector3();
-  /** Автоподстройка графики: замеры времени кадра, пока игрок не выбрал качество сам. */
+  /** Автоподстройка графики: понижать качество можно, пока игрок не выбрал его сам. */
   private autoQuality = true;
   private readonly perfFrames: number[] = [];
-  private perfGood = 0;
+  private perfSlow = 0;
   private playTime = 0;
+  /** Когда последний раз понижали разрешение (по elapsed) — повышаем не раньше чем через 20 с. */
+  private lastDownscale = -Infinity;
 
   constructor(
     private readonly conn: Connection,
@@ -166,6 +169,7 @@ export class Game {
 
     this.chunks = new ChunkManager(this.world, this.scene, this.materials, welcome.seed, settings.renderDistance);
     this.chunks.meshOptions = { fancyLeaves: this.quality.fancyLeaves };
+    this.pipeline.onPass = (camera, shadow) => this.chunks.preparePass(camera, shadow);
     this.world.applyEdits(welcome.edits);
 
     this.player = new LocalPlayer(this.world);
@@ -269,7 +273,32 @@ export class Game {
     this.applyGameMode();
     this.ui.setHud(true);
     this.setMode('loading');
+    this.warmUpShaders();
     requestAnimationFrame(this.frame);
+  }
+
+  /**
+   * Скрытые образцы всего, что появляется в мире позже (мобы, игроки, предметы, стрелы):
+   * их шейдеры компилируются в фоне, пока грузится мир. Образцы остаются в сцене
+   * невидимыми — иначе three.js выбросил бы скомпилированные программы.
+   */
+  private warmUpShaders(): void {
+    const group = new THREE.Group();
+    group.visible = false;
+    const light = { value: new THREE.Vector3(1, 1, 1) };
+    for (const type of Object.keys(MOB_NAMES) as MobType[]) {
+      const mob = createMobModel(type);
+      applyEntityLight(mob.group, light);
+      group.add(mob.group);
+    }
+    group.add(new Avatar('', this.settings.color, [0, 0, 0], this.itemMeshes).group);
+    for (const id of [Block.STONE, Item.STICK]) group.add(this.itemMeshes.create(id).object);
+    const box = new THREE.BoxGeometry(0.1, 0.1, 0.1);
+    const arrow = new THREE.Mesh(box, new THREE.MeshLambertMaterial({ color: '#8b6a3e' }));
+    applyEntityLight(arrow, light);
+    group.add(arrow, new THREE.Mesh(box, new THREE.MeshBasicMaterial({ transparent: true })), new THREE.Mesh(box, this.pipeline.entityDepth));
+    this.scene.add(group);
+    this.pipeline.precompile(group).catch(() => {});
   }
 
   private makeMaterials(): TerrainMaterials {
@@ -484,33 +513,49 @@ export class Game {
     this.itemMeshes.setMaterials(this.materials);
     this.env.setClouds(q.clouds);
     this.onResize();
-    for (const m of [old.solid, old.translucent, old.shadowDepth]) m.dispose();
+    for (const m of [old.opaque, old.cutout, old.translucent, old.shadowOpaque, old.shadowCutout]) m.dispose();
   }
 
   /**
-   * Если кадры стабильно длиннее ~45 мс (меньше 22 FPS), понижаем качество на ступень
-   * и сообщаем об этом в чате. Когда всё плавно — перестаём замерять.
+   * Держим плавные ~45+ FPS: по медиане длительности кадра сначала понижаем разрешение
+   * (до половины), а если и этого мало — качество графики на ступень (пока игрок не выбрал
+   * его сам). Когда запас появился, разрешение понемногу возвращаем.
    */
   private trackPerformance(frameMs: number, dt: number): void {
-    if (!this.autoQuality || this.mode !== 'play' || document.hidden || this.chunks.pendingCount > 0) return;
+    // Пока мир активно подгружается, кадры неровные не из-за видеокарты — не замеряем.
+    if (this.mode !== 'play' || document.hidden || this.chunks.pendingCount > 16) {
+      this.perfFrames.length = 0;
+      return;
+    }
     this.playTime += dt;
-    if (this.playTime < 4) return;
+    if (this.playTime < 3) return;
     this.perfFrames.push(frameMs);
-    if (this.perfFrames.length < 150) return;
+    if (this.perfFrames.length < 60) return;
     const sorted = this.perfFrames.sort((a, b) => a - b);
     const median = sorted[sorted.length >> 1];
     this.perfFrames.length = 0;
-    const order: QualityLevel[] = ['low', 'medium', 'high', 'ultra'];
-    const i = order.indexOf(this.quality.level);
-    if (median > 45 && i > 0) {
+    const scale = this.pipeline.scale;
+    if (median > 22) {
+      this.lastDownscale = this.elapsed;
+      if (scale > 0.55) {
+        this.pipeline.setRenderScale(scale - (median > 40 ? 0.2 : 0.1));
+        return;
+      }
+      const order: QualityLevel[] = ['low', 'medium', 'high', 'ultra'];
+      const i = order.indexOf(this.quality.level);
+      if (!this.autoQuality || i <= 0 || ++this.perfSlow < 2) return;
+      this.perfSlow = 0;
       const next = order[i - 1];
       this.settings.quality = next;
       saveSettings(this.settings);
       this.setQuality(QUALITY_PRESETS[next]);
+      this.pipeline.setRenderScale(0.8);
       $<HTMLSelectElement>('quality').value = next;
       this.ui.addChat(null, undefined, `Графика: «${QUALITY_NAMES[next]}» — так игра пойдёт плавнее. Изменить можно в меню паузы.`);
-      this.perfGood = 0;
-    } else if (median < 30 && ++this.perfGood >= 2) this.autoQuality = false;
+    } else {
+      this.perfSlow = 0;
+      if (median < 17.5 && scale < 1 && this.elapsed - this.lastDownscale > 20) this.pipeline.setRenderScale(scale + 0.05);
+    }
   }
 
   private applyGameMode(): void {
@@ -1279,7 +1324,7 @@ export class Game {
       camera.updateProjectionMatrix();
     }
 
-    this.chunks.update(p.x, p.z, this.mode === 'loading' ? 14 : 5);
+    this.chunks.update(camera, this.mode === 'loading' ? 8 : 3);
 
     this.time = (this.time + dt * 20) % DAY_LENGTH;
     this.rainLevel += (this.rain - this.rainLevel) * Math.min(1, dt * 0.4);
@@ -1391,7 +1436,7 @@ export class Game {
     const info = this.pipeline.renderer.info;
     this.ui.setDebug(
       [
-        `${GAME_NAME} · ${this.fps} FPS · ${QUALITY_NAMES[this.quality.level]}`,
+        `${GAME_NAME} · ${this.fps} FPS · ${QUALITY_NAMES[this.quality.level]} · разрешение ${Math.round(this.pipeline.scale * 100)}%`,
         `XYZ: ${p.x.toFixed(2)} / ${p.y.toFixed(2)} / ${p.z.toFixed(2)}`,
         `Чанк: ${chunkKey(Math.floor(p.x) >> 4, Math.floor(p.z) >> 4)} · загружено ${this.chunks.loadedCount}, в очереди ${this.chunks.pendingCount}`,
         `Смотрит на ${facing}`,

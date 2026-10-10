@@ -4,6 +4,7 @@ import {
   FULL_CUBE,
   GLOW_TILE,
   LAYER,
+  L_CUTOUT,
   L_TRANSLUCENT,
   S_CROP,
   S_CROSS,
@@ -34,6 +35,8 @@ import { modelBoxes, type Box } from '../shared/shapes';
 const P = S + 2;
 const LAYER_SIZE = P * P;
 export const PADDED_SIZE = LAYER_SIZE * (H + 2);
+/** Чанк делится по высоте на секции 16×16×16: для каждой известно, где её грани в индексах меша. */
+export const SECTION_COUNT = H / 16;
 
 const pidx = (x: number, y: number, z: number) => ((y + 1) * P + (z + 1)) * P + (x + 1);
 
@@ -76,6 +79,20 @@ export interface MeshData {
   index: Uint16Array | Uint32Array;
   minY: number;
   maxY: number;
+  /** Начало граней секции s в индексах — sections[s]; sections[SECTION_COUNT] — конец. */
+  sections: Uint32Array;
+}
+
+/** Меши чанка по слоям: непрозрачные блоки, «дырявые» (листва, стекло, растения) и полупрозрачные. */
+export interface ChunkMeshes {
+  opaque: MeshData | null;
+  cutout: MeshData | null;
+  translucent: MeshData | null;
+  /**
+   * Секции (биты), где есть хоть одна грань со светом неба. Остальные — глубокие пещеры:
+   * тень на освещённую солнцем поверхность они бросить не могут, в карту теней их не рисуем.
+   */
+  lit: number;
 }
 
 class MeshBuilder {
@@ -86,12 +103,14 @@ class MeshBuilder {
   indices = 0;
   minY = H;
   maxY = 0;
+  readonly sections = new Uint32Array(SECTION_COUNT + 1);
 
   reset(): void {
     this.verts = 0;
     this.indices = 0;
     this.minY = H;
     this.maxY = 0;
+    this.sections.fill(0);
   }
 
   private grow(): void {
@@ -166,6 +185,7 @@ class MeshBuilder {
       index,
       minY: Math.max(0, Math.floor(this.minY)),
       maxY: Math.min(H, Math.ceil(this.maxY)),
+      sections: this.sections.slice(),
     };
   }
 }
@@ -225,22 +245,27 @@ const packW = (layer: number, face: number, ao: number, glow: number) => layer |
 const packU = (u16: number, wave: number, anim: number) => u16 | (wave << 5) | (anim << 7);
 const lightByte = (level: number) => Math.round(level * 17);
 
-const builders = { solid: new MeshBuilder(), translucent: new MeshBuilder() };
+const builders = { opaque: new MeshBuilder(), cutout: new MeshBuilder(), translucent: new MeshBuilder() };
 
-export function meshChunk(
-  blocks: Uint16Array,
-  light: Uint8Array,
-  options: MeshOptions,
-): { solid: MeshData | null; translucent: MeshData | null } {
-  const solid = builders.solid;
-  const translucent = builders.translucent;
-  solid.reset();
+export function meshChunk(blocks: Uint16Array, light: Uint8Array, options: MeshOptions): ChunkMeshes {
+  const { opaque, cutout, translucent } = builders;
+  opaque.reset();
+  cutout.reset();
   translucent.reset();
   const ao = [0, 0, 0, 0];
   const sky = [0, 0, 0, 0];
   const blk = [0, 0, 0, 0];
+  let lit = 0;
 
   for (let y = 0; y < H; y++) {
+    const secBit = 1 << (y >> 4);
+    // Грани идут снизу вверх, поэтому каждая секция — непрерывный кусок индексов.
+    if ((y & 15) === 0) {
+      const sec = y >> 4;
+      opaque.sections[sec] = opaque.indices;
+      cutout.sections[sec] = cutout.indices;
+      translucent.sections[sec] = translucent.indices;
+    }
     for (let z = 0; z < S; z++) {
       let i = pidx(0, y, z);
       for (let x = 0; x < S; x++, i++) {
@@ -249,7 +274,8 @@ export function meshChunk(
         const shape = SHAPE[type];
         if (shape === S_NONE) continue;
         const meta = state >>> 10;
-        const out = LAYER[type] === L_TRANSLUCENT ? translucent : solid;
+        const layer = LAYER[type];
+        const out = layer === L_TRANSLUCENT ? translucent : layer === L_CUTOUT ? cutout : opaque;
 
         if (shape === S_CUBE) {
           const leaves = WAVE[type] === 1;
@@ -292,6 +318,7 @@ export function meshChunk(
               sky[k] = lightByte(ls / cnt);
               blk[k] = lightByte(lb / cnt);
             }
+            if (sky[0] + sky[1] + sky[2] + sky[3] > 0) lit |= secBit;
             const tile = FACE_TILE[type * 384 + meta * 6 + f];
             const glow = GLOW_TILE[tile];
             const corners = CORNERS[f];
@@ -317,6 +344,8 @@ export function meshChunk(
         const own = light[i];
         const ownSky = lightByte(own >> 4);
         const ownBlock = lightByte(own & 15);
+        // Для простоты: у некубических блоков смотрим свет в самой клетке и над ней.
+        if (own >> 4 || light[i + LAYER_SIZE] >> 4) lit |= secBit;
 
         if (shape === S_CROSS) {
           const tile = FACE_TILE[type * 384 + meta * 6];
@@ -358,7 +387,8 @@ export function meshChunk(
       }
     }
   }
-  return { solid: solid.build(), translucent: translucent.build() };
+  for (const b of [opaque, cutout, translucent]) b.sections[SECTION_COUNT] = b.indices;
+  return { opaque: opaque.build(), cutout: cutout.build(), translucent: translucent.build(), lit };
 }
 
 function crossQuad(
@@ -570,10 +600,75 @@ function meshFluid(out: MeshBuilder, blocks: Uint16Array, light: Uint8Array, i: 
 }
 
 /** Геометрия одиночного блока (для предметов в руке, выпавших блоков, падающего песка). */
-export function meshSingleBlock(state: number): { solid: MeshData | null; translucent: MeshData | null } {
+export function meshSingleBlock(state: number): ChunkMeshes {
   // Блок ставим на высоту 1, чтобы под ним был воздух и нижняя грань не отсекалась.
   const blocks = new Uint16Array(PADDED_SIZE);
   const light = new Uint8Array(PADDED_SIZE).fill(0xf0);
   blocks[pidx(0, 1, 0)] = state;
   return meshChunk(blocks, light, { fancyLeaves: true });
+}
+
+// ---------- Связность секций (для отсечения невидимых пещер) ----------
+
+const SEC_CELLS = 16 * 16 * 16;
+const floodQueue = new Int32Array(SEC_CELLS);
+const floodSeen = new Uint8Array(SEC_CELLS);
+
+/**
+ * Какие грани секции 16×16×16 «видят» друг друга сквозь прозрачные клетки
+ * (воздух, вода, листва, стекло...) — как визграф в Minecraft.
+ * conn[s * 6 + a] — маска граней (биты в порядке +X, -X, +Y, -Y, +Z, -Z),
+ * до которых можно дойти от грани a внутри секции s.
+ */
+export function sectionConnectivity(blocks: Uint16Array): Uint8Array {
+  const conn = new Uint8Array(SECTION_COUNT * 6);
+  for (let sec = 0; sec < SECTION_COUNT; sec++) {
+    const base = (sec * 16 + 1) * LAYER_SIZE + P + 1;
+    const cell = (c: number) => base + (c >> 8) * LAYER_SIZE + ((c >> 4) & 15) * P + (c & 15);
+    let open = 0;
+    for (let c = 0; c < SEC_CELLS; c++) {
+      const solid = FULL_CUBE[blocks[cell(c)] & TYPE_MASK];
+      floodSeen[c] = solid;
+      if (!solid) open++;
+    }
+    if (open === 0) continue;
+    if (open === SEC_CELLS) {
+      conn.fill(0x3f, sec * 6, sec * 6 + 6);
+      continue;
+    }
+    for (let start = 0; start < SEC_CELLS; start++) {
+      if (floodSeen[start]) continue;
+      // Заливка одной связной области прозрачных клеток: запоминаем, каких граней она касается.
+      floodSeen[start] = 1;
+      floodQueue[0] = start;
+      let head = 0;
+      let tail = 1;
+      let faces = 0;
+      const visit = (n: number) => {
+        if (floodSeen[n]) return;
+        floodSeen[n] = 1;
+        floodQueue[tail++] = n;
+      };
+      while (head < tail) {
+        const c = floodQueue[head++];
+        const x = c & 15;
+        const z = (c >> 4) & 15;
+        const y = c >> 8;
+        if (x === 15) faces |= 1;
+        else visit(c + 1);
+        if (x === 0) faces |= 2;
+        else visit(c - 1);
+        if (y === 15) faces |= 4;
+        else visit(c + 256);
+        if (y === 0) faces |= 8;
+        else visit(c - 256);
+        if (z === 15) faces |= 16;
+        else visit(c + 16);
+        if (z === 0) faces |= 32;
+        else visit(c - 16);
+      }
+      for (let f = 0; f < 6; f++) if (faces & (1 << f)) conn[sec * 6 + f] |= faces;
+    }
+  }
+  return conn;
 }

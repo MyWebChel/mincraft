@@ -7,9 +7,10 @@ import {
   WATER_FRAGMENT,
 } from './shaders';
 
-/** Слои three.js: 1 — блоки (отбрасывают тень), 2 — сущности (тоже отбрасывают). */
+/** Слои three.js, отбрасывающие тень: 1 — непрозрачные блоки, 2 — сущности, 3 — «дырявые» блоки (листва, стекло). */
 export const LAYER_TERRAIN = 1;
 export const LAYER_ENTITY = 2;
+export const LAYER_CUTOUT = 3;
 
 /** Общие uniform-переменные всех шейдеров мира. */
 export function createSharedUniforms() {
@@ -43,9 +44,13 @@ export interface MaterialOptions {
 }
 
 export interface TerrainMaterials {
-  solid: THREE.RawShaderMaterial;
+  /** Непрозрачные блоки: без альфа-теста, чтобы видеокарта отбрасывала закрытые пиксели до шейдера. */
+  opaque: THREE.RawShaderMaterial;
+  /** Листва, стекло, растения: пиксели с прозрачностью отбрасываются. */
+  cutout: THREE.RawShaderMaterial;
   translucent: THREE.RawShaderMaterial;
-  shadowDepth: THREE.RawShaderMaterial;
+  shadowOpaque: THREE.RawShaderMaterial;
+  shadowCutout: THREE.RawShaderMaterial;
   /** Для одиночных блоков-сущностей (предметы, падающий песок): свет задаётся uniform-ом. */
   entityBlock: (light: THREE.Vector2, noFog?: boolean) => THREE.RawShaderMaterial;
   atlas: THREE.DataArrayTexture;
@@ -70,12 +75,19 @@ export function createTerrainMaterials(atlas: THREE.DataArrayTexture, shared: Sh
   }
   const uniforms = { ...shared, uAtlas: { value: atlas } };
 
-  const solid = new THREE.RawShaderMaterial({
+  const opaque = new THREE.RawShaderMaterial({
     glslVersion: THREE.GLSL3,
     vertexShader: TERRAIN_VERTEX,
     fragmentShader: TERRAIN_FRAGMENT,
     uniforms,
     defines,
+  });
+  const cutout = new THREE.RawShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    vertexShader: TERRAIN_VERTEX,
+    fragmentShader: TERRAIN_FRAGMENT,
+    uniforms,
+    defines: { ...defines, ALPHA_TEST: 1 },
   });
   const translucent = new THREE.RawShaderMaterial({
     glslVersion: THREE.GLSL3,
@@ -87,15 +99,20 @@ export function createTerrainMaterials(atlas: THREE.DataArrayTexture, shared: Sh
     depthWrite: false,
     side: THREE.DoubleSide,
   });
-  const shadowDepth = new THREE.RawShaderMaterial({
-    glslVersion: THREE.GLSL3,
-    vertexShader: SHADOW_VERTEX,
-    fragmentShader: SHADOW_FRAGMENT,
-    uniforms,
-    defines: opts.waving ? { WAVING: 1 } : {},
-    side: THREE.DoubleSide,
-  });
-  const entityDefines: Record<string, string | number> = { ...defines, ENTITY: 1 };
+  // В карту теней пишется только глубина; непрозрачным блокам не нужны ни текстура, ни колыхание.
+  const shadow = (extra: Record<string, number>) =>
+    new THREE.RawShaderMaterial({
+      glslVersion: THREE.GLSL3,
+      vertexShader: SHADOW_VERTEX,
+      fragmentShader: SHADOW_FRAGMENT,
+      uniforms,
+      defines: extra,
+      side: THREE.DoubleSide,
+      colorWrite: false,
+    });
+  const shadowOpaque = shadow({});
+  const shadowCutout = shadow(opts.waving ? { WAVING: 1, ALPHA_TEST: 1 } : { ALPHA_TEST: 1 });
+  const entityDefines: Record<string, string | number> = { ...defines, ENTITY: 1, ALPHA_TEST: 1 };
   delete entityDefines.WAVING;
   const entityBlock = (light: THREE.Vector2, noFog = false) =>
     new THREE.RawShaderMaterial({
@@ -105,7 +122,7 @@ export function createTerrainMaterials(atlas: THREE.DataArrayTexture, shared: Sh
       uniforms: { ...uniforms, uEntityLight: { value: light }, uNoFog: { value: noFog ? 1 : 0 } },
       defines: entityDefines,
     });
-  return { solid, translucent, shadowDepth, entityBlock, atlas };
+  return { opaque, cutout, translucent, shadowOpaque, shadowCutout, entityBlock, atlas };
 }
 
 /**

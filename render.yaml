@@ -1,0 +1,13 @@
+# Render Blueprint: New → Blueprint → выбрать этот репозиторий.
+# На бесплатном тарифе диск не сохраняется: мир сбрасывается при перезапуске.
+services:
+  - type: web
+    name: mincraft
+    runtime: node
+    plan: free
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "22"

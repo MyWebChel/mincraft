@@ -77,9 +77,10 @@ export class InventoryUI {
       this.pointer = { x: e.clientX, y: e.clientY };
       this.placeFloating();
     });
-    // Клик мимо окна — выбросить то, что держим.
+    // Клик мимо окна — выбросить то, что держим (кроме кнопки «закрыть»: тогда предмет вернётся в инвентарь).
     screen.addEventListener('pointerdown', (e) => {
-      if (this.panel.contains(e.target as Node) || this.book.contains(e.target as Node)) return;
+      const target = e.target as HTMLElement;
+      if (this.panel.contains(target) || this.book.contains(target) || target.closest('#inv-close')) return;
       if (!this.cursor) return;
       if (e.button === 2) {
         this.h.drop({ ...this.cursor, count: 1 });

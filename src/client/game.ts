@@ -496,11 +496,14 @@ export class Game {
       }
     };
     window.addEventListener('keydown', (e) => {
-      if (this.mode === 'inventory' && (e.code === 'KeyE' || e.code === 'Escape')) {
+      // Автоповтор зажатой E не должен закрывать только что открытое окно.
+      if (this.mode === 'inventory' && !e.repeat && (e.code === 'KeyE' || e.code === 'Escape')) {
         e.preventDefault();
         this.invUI.close();
       }
     });
+    // На телефоне клавиш нет — окно закрывается кнопкой.
+    $('inv-close').onclick = () => this.invUI.close();
     this.renderHotbar();
   }
 

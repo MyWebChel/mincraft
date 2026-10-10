@@ -29,6 +29,9 @@ export class Input {
   private readonly keys = new Set<string>();
   private lookX = 0;
   private lookY = 0;
+  /** Когда курсор последний раз захвачен и размер прошлого движения мыши — для отсева ложных рывков. */
+  private lockedAt = 0;
+  private lastMove = 0;
   private lastSpace = 0;
   private lastW = 0;
   private sprintLatch = false;
@@ -49,6 +52,11 @@ export class Input {
       this.h.useEnd();
     });
     document.addEventListener('mousemove', this.onMouseMove);
+    document.addEventListener('pointerlockchange', () => {
+      if (!this.pointerLocked) return;
+      this.lockedAt = performance.now();
+      this.lastMove = 0;
+    });
     canvas.addEventListener('mousedown', this.onMouseDown);
     window.addEventListener('mouseup', this.onMouseUp);
     canvas.addEventListener('wheel', this.onWheel, { passive: false });
@@ -98,11 +106,15 @@ export class Input {
   private onKeyDown = (e: KeyboardEvent) => {
     if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
     if (!this.active) return;
-    if (['Space', 'Tab', 'F3', 'F5', 'Slash', 'ArrowUp', 'ArrowDown', 'KeyQ'].includes(e.code)) e.preventDefault();
-    // Ctrl+W закрыл бы вкладку — для бега есть R и двойное нажатие W.
-    if (e.ctrlKey && e.code === 'KeyW') e.preventDefault();
-    if (e.repeat) return;
+    if (['Space', 'Tab', 'F1', 'F3', 'F5', 'Slash', 'ArrowUp', 'ArrowDown', 'KeyQ'].includes(e.code)) e.preventDefault();
+    // Ctrl — бег, как в Minecraft. Сочетания браузера посреди игры (Ctrl+D — закладка, Ctrl+S —
+    // сохранение страницы...) открывали окна: курсор освобождался, а нажатые клавиши терялись.
+    // Ctrl+W браузер всё равно закроет вкладку — для бега есть R и двойное нажатие W.
+    if (e.ctrlKey || e.metaKey) e.preventDefault();
+    // Автоповтор зажатой клавиши возвращает её в набор (W после закрытия инвентаря снова ведёт вперёд),
+    // а действия срабатывают только по первому нажатию.
     this.keys.add(e.code);
+    if (e.repeat) return;
 
     if (e.code === 'Space') {
       const now = performance.now();
@@ -134,6 +146,8 @@ export class Input {
       case 'KeyE':
         this.release();
         this.h.inventory();
+        // Это же нажатие дальше увидел бы обработчик «E — закрыть инвентарь» и сразу закрыл бы окно.
+        e.stopImmediatePropagation();
         break;
       case 'KeyQ':
         this.h.drop(e.ctrlKey);
@@ -157,8 +171,16 @@ export class Input {
 
   private onMouseMove = (e: MouseEvent) => {
     if (!this.active || !this.pointerLocked) return;
-    // Защита от редких огромных скачков движения мыши в некоторых браузерах.
-    if (Math.abs(e.movementX) > 400 || Math.abs(e.movementY) > 400) return;
+    // Сразу после захвата курсора (и изредка посреди игры) браузеры присылают ложный рывок —
+    // одно событие во много раз больше соседних. Камера от него резко поворачивалась,
+    // и «вперёд» внезапно уводило в сторону. Настоящий быстрый взмах так не выглядит.
+    const m = Math.max(Math.abs(e.movementX), Math.abs(e.movementY));
+    // Пустые события (браузер шлёт их, например, при обновлении интерфейса) не в счёт.
+    if (m === 0) return;
+    const prev = this.lastMove;
+    this.lastMove = m;
+    if (performance.now() - this.lockedAt < 120) return;
+    if (m > 400 || (m > 200 && m > 10 * Math.max(prev, 15))) return;
     this.lookX += e.movementX;
     this.lookY += e.movementY;
   };
@@ -199,15 +221,27 @@ export class Input {
     let holding = false;
     let movedFar = false;
 
+    // Палец лёг около середины — центр джойстика там, где палец: иначе касание чуть сбоку
+    // сразу вело вбок, и «вперёд» получалось по диагонали. Палец сразу на краю — значит,
+    // идти именно туда (центр — середина круга). Небольшое отклонение не считается,
+    // а почти прямое направление выравнивается точно по оси.
+    let origin = { x: 0, y: 0 };
+    const DEAD = 0.15;
+    const SNAP = 0.32; // ~18°
     const moveStick = (t: Touch) => {
-      const r = stick.getBoundingClientRect();
-      const radius = r.width / 2;
-      let dx = (t.clientX - (r.left + radius)) / radius;
-      let dy = (t.clientY - (r.top + radius)) / radius;
-      const len = Math.hypot(dx, dy);
-      if (len > 1) {
-        dx /= len;
-        dy /= len;
+      const radius = stick.getBoundingClientRect().width / 2;
+      let dx = (t.clientX - origin.x) / (radius * 0.8);
+      let dy = (t.clientY - origin.y) / (radius * 0.8);
+      const len = Math.min(1, Math.hypot(dx, dy));
+      if (len < DEAD) {
+        dx = dy = 0;
+      } else {
+        let angle = Math.atan2(dy, dx);
+        const axis = Math.round(angle / (Math.PI / 2)) * (Math.PI / 2);
+        if (Math.abs(angle - axis) < SNAP) angle = axis;
+        const k = (len - DEAD) / (1 - DEAD);
+        dx = Math.cos(angle) * k;
+        dy = Math.sin(angle) * k;
       }
       this.stick = { x: dx, y: dy };
       knob.style.transform = `translate(${dx * radius * 0.6}px, ${dy * radius * 0.6}px)`;
@@ -217,6 +251,11 @@ export class Input {
       e.preventDefault();
       const t = e.changedTouches[0];
       stickId = t.identifier;
+      const r = stick.getBoundingClientRect();
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      const nearCentre = Math.hypot(t.clientX - cx, t.clientY - cy) < r.width / 4;
+      origin = nearCentre ? { x: t.clientX, y: t.clientY } : { x: cx, y: cy };
       moveStick(t);
     });
     this.canvas.addEventListener('touchstart', (e) => {

@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#1b1b1b" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <title>Mincraft</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Pixelify+Sans:wght@400;600&family=Press+Start+2P&display=swap" rel="stylesheet" />
+    <script type="module" crossorigin src="./assets/index-D9Czbihe.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-8Bgnw7Ci.css">
+  </head>
+  <body>
+    <div id="app">
+      <div id="hud" hidden>
+        <div id="underwater"></div>
+        <div id="sleep-overlay">
+          <p>Сон…</p>
+          <p class="hint">Ночь пройдёт, когда уснут все игроки. Чтобы встать — Shift или любая клавиша движения.</p>
+          <button id="wake" class="mc-button small">Встать с кровати</button>
+        </div>
+        <div id="crosshair"></div>
+        <div id="rotate-hint">Поверните телефон горизонтально — так играть удобнее</div>
+        <pre id="debug" hidden></pre>
+        <div id="chat">
+          <div id="chat-log"></div>
+          <form id="chat-form" hidden>
+            <input id="chat-input" maxlength="200" autocomplete="off" enterkeyhint="send" />
+          </form>
+        </div>
+        <div id="player-list" hidden></div>
+        <div id="bottom-bar">
+          <div id="item-name"></div>
+          <div id="status">
+            <div class="status-col">
+              <div id="armor-bar" class="icons"></div>
+              <div id="hearts" class="icons"></div>
+            </div>
+            <div class="status-col right">
+              <div id="air" class="icons"></div>
+              <div id="food" class="icons"></div>
+            </div>
+          </div>
+          <div id="hotbar"></div>
+        </div>
+      </div>
+
+      <div id="touch" hidden>
+        <div id="joystick"><div id="joystick-knob"></div></div>
+        <div class="touch-top">
+          <button id="btn-chat" class="touch-btn small">Чат</button>
+          <button id="btn-drop" class="touch-btn small">Выбросить</button>
+          <button id="btn-inventory" class="touch-btn small">Инвентарь</button>
+          <button id="btn-pause" class="touch-btn small">II</button>
+        </div>
+        <div class="touch-actions">
+          <button id="btn-attack" class="touch-btn">Бить</button>
+          <button id="btn-use" class="touch-btn">Ставить</button>
+          <button id="btn-sneak" class="touch-btn">Присесть</button>
+          <button id="btn-jump" class="touch-btn">Прыжок</button>
+          <button id="btn-fly" class="touch-btn small creative-only">Полёт</button>
+          <button id="btn-down" class="touch-btn small creative-only">Вниз</button>
+        </div>
+      </div>
+
+      <div id="menu" class="screen dirt">
+        <h1 class="logo">Mincraft</h1>
+        <p class="splash">Теперь и на телефоне!</p>
+        <div class="menu-row">
+          <form id="join-form" class="panel">
+            <label class="field">
+              <span>Ваш ник</span>
+              <input id="name-input" maxlength="16" autocomplete="nickname" spellcheck="false" required />
+            </label>
+            <div class="field">
+              <span>Цвет одежды</span>
+              <div id="color-picker"></div>
+            </div>
+            <p id="invite-banner" hidden>Вас пригласили в игру!</p>
+            <button id="play" class="mc-button" type="submit">Играть</button>
+            <div id="world-actions" class="row" hidden>
+              <button id="own-world" class="mc-button small" type="button" hidden>Играть в своём мире</button>
+              <button id="new-world" class="mc-button small" type="button">Новый мир</button>
+            </div>
+            <p id="menu-status" role="status"></p>
+          </form>
+          <div id="share" class="panel share" hidden>
+            <b>Играть вместе</b>
+            <p>Откройте этот адрес на телефоне или другом компьютере (в той же Wi-Fi сети):</p>
+            <div id="share-links"></div>
+            <div id="share-qr"></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="loading" class="screen dirt" hidden>
+        <p>Загрузка мира…</p>
+        <div class="progress"><div id="loading-bar"></div></div>
+      </div>
+
+      <div id="pause" class="screen" hidden>
+        <h2>Меню игры</h2>
+        <button id="resume" class="mc-button">Начать игру</button>
+        <button id="invite-btn" class="mc-button" hidden>Пригласить друзей</button>
+        <div id="invite" class="panel share" hidden>
+          <b>Пригласить друзей</b>
+          <p id="invite-status">Подключаемся к серверу приглашений…</p>
+          <div id="invite-link"></div>
+          <div id="invite-qr"></div>
+          <p class="hint">Друг открывает ссылку или наводит камеру телефона на QR-код — и попадает в ваш мир. Пока друзья играют, не закрывайте игру.</p>
+        </div>
+        <div class="panel settings">
+          <label class="slider">
+            <span>Графика</span>
+            <select id="quality"></select>
+          </label>
+          <label class="slider">
+            <span>Дальность прорисовки: <b id="rd-value"></b></span>
+            <input type="range" id="rd" min="2" max="16" step="1" />
+          </label>
+          <label class="slider">
+            <span>Поле зрения: <b id="fov-value"></b></span>
+            <input type="range" id="fov" min="50" max="110" step="1" />
+          </label>
+          <label class="slider">
+            <span>Чувствительность: <b id="sens-value"></b></span>
+            <input type="range" id="sens" min="1" max="20" step="1" />
+          </label>
+          <label class="slider">
+            <span>Громкость: <b id="vol-value"></b></span>
+            <input type="range" id="vol" min="0" max="100" step="5" />
+          </label>
+          <label class="slider">
+            <span>Музыка: <b id="music-value"></b></span>
+            <input type="range" id="music" min="0" max="100" step="5" />
+          </label>
+          <div class="row">
+            <button id="fullscreen" class="mc-button small" type="button">На весь экран</button>
+            <button id="to-menu" class="mc-button small" type="button">Выйти в меню</button>
+          </div>
+        </div>
+        <div class="panel help">
+          <div><kbd>WASD</kbd> ходить</div>
+          <div><kbd>Пробел</kbd> прыжок</div>
+          <div><kbd>Shift</kbd> присесть / вниз</div>
+          <div><kbd>R</kbd>, <kbd>W ×2</kbd> бег</div>
+          <div><kbd>ЛКМ</kbd> ломать / бить</div>
+          <div><kbd>ПКМ</kbd> ставить / есть / открыть</div>
+          <div><kbd>СКМ</kbd> взять блок</div>
+          <div><kbd>1–9</kbd>, колесо — выбор</div>
+          <div><kbd>E</kbd> инвентарь и крафт</div>
+          <div><kbd>Q</kbd> выбросить предмет</div>
+          <div><kbd>T</kbd> чат, <kbd>/help</kbd> команды</div>
+          <div><kbd>F5</kbd> вид, <kbd>F3</kbd> отладка</div>
+          <div><kbd>Пробел ×2</kbd> полёт (творческий)</div>
+          <div><kbd>Tab</kbd> список игроков</div>
+        </div>
+      </div>
+
+      <div id="death" class="screen red" hidden>
+        <h2 class="big">Вы погибли!</h2>
+        <p id="death-cause"></p>
+        <button id="respawn" class="mc-button">Возродиться</button>
+      </div>
+
+      <div id="inventory-screen" class="screen" hidden>
+        <div class="inv-wrap">
+          <div id="recipe-book" class="inv-panel recipe-book" hidden></div>
+          <div id="inventory-panel" class="inv-panel"></div>
+        </div>
+      </div>
+      <div id="cursor-item" class="slot-like" hidden></div>
+      <div id="tooltip" hidden></div>
+
+      <div id="disconnected" class="screen dirt" hidden>
+        <h2>Соединение потеряно</h2>
+        <p id="disconnect-reason"></p>
+        <button id="reconnect" class="mc-button">Переподключиться</button>
+        <button id="disconnect-menu" class="mc-button">В главное меню</button>
+      </div>
+    </div>
+  </body>
+</html>

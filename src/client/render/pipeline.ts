@@ -107,6 +107,9 @@ export class Pipeline {
   onPass: (camera: THREE.Camera, shadow: boolean) => void = () => {};
   /** Сила красной виньетки при получении урона (0..1). */
   damageFlash = 0;
+  /** Страх (0..1): тёмная виньетка и блеклые цвета; сбой изображения (0..1). */
+  dread = 0;
+  glitch = 0;
   exposure = 1.0;
 
   constructor(
@@ -140,6 +143,8 @@ export class Pipeline {
         uUnderwaterTint: { value: 0 },
         uTimeF: { value: 0 },
         uDamage: { value: 0 },
+        uDread: { value: 0 },
+        uGlitch: { value: 0 },
       },
       depthTest: false,
       depthWrite: false,
@@ -330,6 +335,8 @@ export class Pipeline {
     fu.uUnderwaterTint.value = underwater ? 1 : 0;
     fu.uTimeF.value = time;
     fu.uDamage.value = this.damageFlash;
+    fu.uDread.value = this.dread;
+    fu.uGlitch.value = this.glitch;
     r.setRenderTarget(null);
     r.clear(true, true, false);
     this.finalQuad.render(r);

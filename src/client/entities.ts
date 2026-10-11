@@ -52,6 +52,9 @@ const shortestAngle = (a: number) => Math.atan2(Math.sin(a), Math.cos(a));
 export class EntityRenderer {
   private readonly visuals = new Map<number, Visual>();
   private time = 0;
+  /** «Все уставились»: мобы рядом с этой точкой замирают и смотрят на неё (жуткое событие). */
+  private stareAt: THREE.Vector3 | null = null;
+  private stareUntil = 0;
 
   constructor(
     private readonly scene: THREE.Scene,
@@ -231,6 +234,19 @@ export class EntityRenderer {
     for (const [id, v] of this.visuals) this.dispose(id, v);
   }
 
+  /** Мобы в радиусе 32 блоков на seconds секунд замирают и смотрят на точку (глаза игрока). */
+  stare(at: THREE.Vector3, seconds: number): void {
+    this.stareAt = at;
+    this.stareUntil = this.time + seconds;
+  }
+
+  /** Сколько живых мобов в радиусе r от точки. */
+  mobsNear(at: THREE.Vector3, r: number): number {
+    let n = 0;
+    for (const v of this.visuals.values()) if (v.info.kind === 'mob' && v.death === 0 && v.object.position.distanceToSquared(at) < r * r) n++;
+    return n;
+  }
+
   update(dt: number): void {
     this.time += dt;
     const tmp = new THREE.Vector3();
@@ -244,10 +260,22 @@ export class EntityRenderer {
       }
       const prevX = pos.x;
       const prevZ = pos.z;
-      if (pos.distanceToSquared(v.target) > 64) pos.copy(v.target);
-      else pos.lerp(v.target, 1 - Math.exp(-dt * 12));
-      v.yaw += shortestAngle(v.targetYaw - v.yaw) * (1 - Math.exp(-dt * 10));
-      v.pitch += shortestAngle(v.targetPitch - v.pitch) * (1 - Math.exp(-dt * 10));
+      const at = this.stareAt;
+      const staring = at !== null && this.time < this.stareUntil && v.info.kind === 'mob' && v.death === 0 && pos.distanceToSquared(at) < 32 * 32;
+      let lookUp = 0;
+      if (staring) {
+        // Замер на месте и медленно повернулся к игроку; голова смотрит прямо на него.
+        const dx = at.x - pos.x;
+        const dz = at.z - pos.z;
+        v.yaw += shortestAngle(Math.atan2(-dx, -dz) - v.yaw) * (1 - Math.exp(-dt * 2.5));
+        v.pitch += shortestAngle(0 - v.pitch) * (1 - Math.exp(-dt * 5));
+        lookUp = Math.atan2(at.y - (pos.y + (v.mob?.height ?? 1) * 0.85), Math.hypot(dx, dz));
+      } else {
+        if (pos.distanceToSquared(v.target) > 64) pos.copy(v.target);
+        else pos.lerp(v.target, 1 - Math.exp(-dt * 12));
+        v.yaw += shortestAngle(v.targetYaw - v.yaw) * (1 - Math.exp(-dt * 10));
+        v.pitch += shortestAngle(v.targetPitch - v.pitch) * (1 - Math.exp(-dt * 10));
+      }
 
       // Свет в клетке сущности.
       const lb = this.world.getLight(Math.floor(pos.x), Math.floor(pos.y + 0.5), Math.floor(pos.z));
@@ -276,7 +304,7 @@ export class EntityRenderer {
             walkPhase: v.walkPhase,
             walkAmount: v.walkAmount,
             headYaw: v.pitch,
-            headPitch: 0,
+            headPitch: lookUp,
             attackTime: v.attackTime,
             fuse: v.fuse,
             sheared: (v.flags & ENTITY_FLAG_SHEARED) !== 0,

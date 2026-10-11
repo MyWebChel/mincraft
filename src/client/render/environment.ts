@@ -34,6 +34,11 @@ export class Environment {
   night = 0;
   /** Насколько солнце видно (для лучей и бликов). */
   sunVisibility = 1;
+  /** Плотный туман (цель 0..1, меняется плавно) и «кровавая луна» ночью (0..1). */
+  fogTarget = 0;
+  bloodTarget = 0;
+  private fog = 0;
+  private blood = 0;
   readonly rayColor = new THREE.Vector3();
   private readonly dome: THREE.Mesh;
   private readonly skyUniforms: Record<string, THREE.IUniform>;
@@ -103,6 +108,26 @@ export class Environment {
       light = mix3([0, 0, 0], NIGHT.light, k);
     }
 
+    // Кровавая луна: ночное небо, свет и туман краснеют.
+    this.blood += (this.bloodTarget - this.blood) * Math.min(1, dt * 0.25);
+    const red = this.blood * this.night;
+    if (red > 0.001) {
+      zenith = mix3(zenith, [0.06, 0.004, 0.004], red);
+      horizon = mix3(horizon, [0.26, 0.02, 0.015], red);
+      ambient = mix3(ambient, [0.17, 0.045, 0.04], red);
+      if (h <= -0.06) light = mix3(light, [0.42, 0.06, 0.05], red);
+    }
+
+    // Густой туман: небо и солнце блекнут до серой мглы.
+    this.fog += (this.fogTarget - this.fog) * Math.min(1, dt * 0.15);
+    const mist = this.fog;
+    if (mist > 0.001) {
+      const grey = mix3([0.02, 0.022, 0.026], [0.58, 0.6, 0.62], day);
+      zenith = mix3(zenith, grey, mist * 0.8);
+      horizon = mix3(horizon, grey, mist * 0.9);
+      light = mix3(light, [light[0] * 0.35, light[1] * 0.35, light[2] * 0.37], mist);
+    }
+
     if (rain > 0) {
       const grey = mix3([0.01, 0.012, 0.02], RAIN_SKY, day);
       zenith = mix3(zenith, grey, rain * 0.85);
@@ -117,18 +142,21 @@ export class Environment {
     u.uAmbient.value.set(...ambient);
     u.uZenith.value.set(...zenith);
     u.uHorizon.value.set(...horizon);
-    u.uSunGlow.value.set(...glow).multiplyScalar(1 - rain * 0.8);
+    u.uSunGlow.value.set(...glow).multiplyScalar((1 - rain * 0.8) * (1 - mist * 0.8));
     u.uRain.value = rain;
     u.uUnderwater.value = underwater ? 1 : 0;
     u.uWaterFog.value.set(0.015, 0.06, 0.13).multiplyScalar(0.25 + 0.75 * this.daylight);
     const far = Math.max(32, renderDistance * 16 - 6);
-    u.uFogFar.value = far * (1 - rain * 0.35);
-    u.uFogNear.value = far * (0.42 - rain * 0.2);
+    const thick = 1 - mist * 0.68;
+    u.uFogFar.value = far * (1 - rain * 0.35) * thick;
+    u.uFogNear.value = far * (0.42 - rain * 0.2) * thick * thick;
 
     this.skyUniforms.uNight.value = this.night;
     this.skyUniforms.uSunDisk.value.set(55, 46, 32).multiplyScalar(smoothstep(-0.05, 0.05, h));
-    this.skyUniforms.uMoonDisk.value.set(2.6, 2.8, 3.2).multiplyScalar(smoothstep(-0.05, 0.05, -h));
-    this.sunVisibility = smoothstep(-0.02, 0.12, h) * (1 - rain);
+    this.skyUniforms.uMoonDisk.value
+      .set(2.6 + 1.6 * this.blood, 2.8 - 2.4 * this.blood, 3.2 - 2.9 * this.blood)
+      .multiplyScalar(smoothstep(-0.05, 0.05, -h));
+    this.sunVisibility = smoothstep(-0.02, 0.12, h) * (1 - rain) * (1 - mist * 0.85);
     this.rayColor.set(...glow).multiplyScalar(0.9 + sunset).lerp(new THREE.Vector3(...light).multiplyScalar(0.25), 0.4);
 
     this.dome.position.copy(camera.position);

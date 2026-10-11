@@ -11,6 +11,8 @@ export interface Settings {
   quality: QualityLevel;
   volume: number;
   music: number;
+  /** Хоррор: Херобрин и жуткие события. */
+  horror: boolean;
 }
 
 const KEY = 'minecraft:settings:v3';
@@ -53,6 +55,7 @@ function defaults(): Settings {
     quality,
     volume: 80,
     music: 40,
+    horror: true,
   };
 }
 
@@ -71,6 +74,7 @@ export function loadSettings(): Settings {
     }
     const s: Settings = { ...d, ...saved };
     if (!['low', 'medium', 'high', 'ultra'].includes(s.quality)) s.quality = d.quality;
+    if (typeof s.horror !== 'boolean') s.horror = d.horror;
     return s;
   } catch {
     return d;

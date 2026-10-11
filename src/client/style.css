@@ -1073,3 +1073,50 @@ kbd {
     grid-column: 1 / -1;
   }
 }
+
+/* ---------- Ужасы ---------- */
+
+.horror-flash {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  background: radial-gradient(circle, rgba(0, 0, 0, 0.35), #000 78%);
+}
+
+.horror-flash.text {
+  background: radial-gradient(circle, rgba(0, 0, 0, 0.15), rgba(0, 0, 0, 0.75) 85%);
+}
+
+.horror-flash canvas {
+  width: min(88vw, 88vh);
+  height: min(88vw, 88vh);
+  image-rendering: pixelated;
+  filter: contrast(1.35) drop-shadow(0 0 18px rgba(255, 255, 255, 0.5));
+  animation: horror-shake 0.06s steps(2) infinite;
+}
+
+.horror-flash p {
+  margin: 0;
+  font: 700 clamp(40px, 12vw, 140px) var(--font);
+  letter-spacing: 0.08em;
+  color: #fff;
+  text-align: center;
+  text-shadow:
+    4px 0 #b00000,
+    -4px 0 #00c8ff,
+    0 0 30px #fff;
+  animation: horror-shake 0.06s steps(2) infinite;
+}
+
+@keyframes horror-shake {
+  0% {
+    transform: translate(-1.5%, 1%) scale(1.02);
+  }
+  100% {
+    transform: translate(1.5%, -1%) scale(0.99);
+  }
+}

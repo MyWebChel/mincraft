@@ -1,5 +1,5 @@
 import { createNoise2D, createNoise3D, type NoiseFunction2D, type NoiseFunction3D } from 'simplex-noise';
-import { Block, REPLACEABLE, makeState, typeOf } from './blocks';
+import { Block, FULL_CUBE, REPLACEABLE, makeState, typeOf } from './blocks';
 import { CHUNK_SIZE, CHUNK_VOLUME, SEA_LEVEL, WORLD_HEIGHT, blockIndex } from './constants';
 import { hash3, mulberry32 } from './rng';
 
@@ -19,6 +19,11 @@ export interface ColumnInfo {
 }
 
 const TREE_CELL = 5;
+/** Сторона региона (в блоках), в котором может быть один ровный тоннель 2×2. */
+const TUNNEL_REGION = 64;
+/** Регионы (в чанках) для пирамид на мелководье и алтарей. */
+const PYRAMID_REGION = 4;
+const SHRINE_REGION = 6;
 const MOUNTAIN_LEVEL = SEA_LEVEL + 38;
 export const SNOW_LINE = SEA_LEVEL + 50;
 /** Ниже этого уровня пустоты пещер заполнены лавой. */
@@ -124,6 +129,7 @@ export class WorldGenerator {
 
   generateChunk(cx: number, cz: number): Uint16Array {
     const data = new Uint16Array(CHUNK_VOLUME);
+    const heights = new Int16Array(CHUNK_SIZE * CHUNK_SIZE);
     const x0 = cx * CHUNK_SIZE;
     const z0 = cz * CHUNK_SIZE;
 
@@ -132,6 +138,7 @@ export class WorldGenerator {
         const x = x0 + lx;
         const z = z0 + lz;
         const { height: h, biome } = this.column(x, z);
+        heights[lz * CHUNK_SIZE + lx] = h;
         const r = hash3(x, 0, z, this.seed + 7);
         const fillDepth = 3 + Math.floor(r * 2);
 
@@ -214,8 +221,153 @@ export class WorldGenerator {
       }
     }
 
+    this.placeOddities(data, heights, cx, cz);
     this.placeTrees(data, cx, cz);
     return data;
+  }
+
+  /**
+   * Жуткие находки, будто здесь кто-то был: ровные тоннели 2×2 глубоко под землёй,
+   * одинокие факелы в пещерах, песчаные пирамиды с огнём на вершине посреди мелководья,
+   * алтарь из золота и замшелого булыжника.
+   */
+  private placeOddities(data: Uint16Array, heights: Int16Array, cx: number, cz: number): void {
+    this.carveTunnels(data, heights, cx, cz);
+    this.placeCaveTorches(data, heights, cx, cz);
+    this.placePyramid(data, heights, cx, cz);
+    this.placeShrine(data, heights, cx, cz);
+  }
+
+  /** Тоннель региона: начало, направление и длина (или null — в этом регионе его нет). */
+  private tunnel(rx: number, rz: number): { x: number; y: number; z: number; dx: number; dz: number; length: number } | null {
+    const h = (k: number) => hash3(rx, k, rz, this.seed + 41);
+    if (h(0) >= 0.35) return null;
+    const alongX = h(4) < 0.5;
+    const dir = h(5) < 0.5 ? 1 : -1;
+    return {
+      x: rx * TUNNEL_REGION + Math.floor(h(1) * TUNNEL_REGION),
+      y: 16 + Math.floor(h(2) * 22),
+      z: rz * TUNNEL_REGION + Math.floor(h(3) * TUNNEL_REGION),
+      dx: alongX ? dir : 0,
+      dz: alongX ? 0 : dir,
+      length: 24 + Math.floor(h(6) * 36),
+    };
+  }
+
+  /** Ровно 2×2 и по прямой — так пещеры не выглядят. Тоннель короче региона, поэтому хватает соседних. */
+  private carveTunnels(data: Uint16Array, heights: Int16Array, cx: number, cz: number): void {
+    const x0 = cx * CHUNK_SIZE;
+    const z0 = cz * CHUNK_SIZE;
+    const rx0 = Math.floor(x0 / TUNNEL_REGION);
+    const rz0 = Math.floor(z0 / TUNNEL_REGION);
+    for (let rz = rz0 - 1; rz <= rz0 + 1; rz++)
+      for (let rx = rx0 - 1; rx <= rx0 + 1; rx++) {
+        const t = this.tunnel(rx, rz);
+        if (!t) continue;
+        // Ширина — поперёк хода.
+        const wx = t.dz !== 0 ? 1 : 0;
+        const wz = t.dx !== 0 ? 1 : 0;
+        for (let i = 0; i < t.length; i++)
+          for (let w = 0; w < 2; w++) {
+            const x = t.x + t.dx * i + wx * w;
+            const z = t.z + t.dz * i + wz * w;
+            const lx = x - x0;
+            const lz = z - z0;
+            if (lx < 0 || lx >= CHUNK_SIZE || lz < 0 || lz >= CHUNK_SIZE) continue;
+            // Глубоко под землёй, не под водой и не под сыпучим песком.
+            if (t.y + 7 > heights[lz * CHUNK_SIZE + lx]) continue;
+            const roof = typeOf(data[blockIndex(lx, t.y + 2, lz)]);
+            if (roof === Block.WATER || roof === Block.LAVA || roof === Block.SAND || roof === Block.GRAVEL) continue;
+            for (let y = t.y; y < t.y + 2; y++) {
+              const at = blockIndex(lx, y, lz);
+              const type = typeOf(data[at]);
+              if (type !== Block.WATER && type !== Block.LAVA && type !== Block.BEDROCK) data[at] = Block.AIR;
+            }
+            // У входа в тоннель горит факел.
+            const start = blockIndex(lx, t.y, lz);
+            if (i === 0 && w === 0 && data[start] === Block.AIR && hash3(rx, 7, rz, this.seed + 41) < 0.6 && FULL_CUBE[typeOf(data[blockIndex(lx, t.y - 1, lz)])])
+              data[start] = makeState(Block.TORCH, 0);
+          }
+      }
+  }
+
+  /** Изредка на полу пещеры стоит факел — кто его поставил? */
+  private placeCaveTorches(data: Uint16Array, heights: Int16Array, cx: number, cz: number): void {
+    for (let lz = 0; lz < CHUNK_SIZE; lz++)
+      for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+        const x = cx * CHUNK_SIZE + lx;
+        const z = cz * CHUNK_SIZE + lz;
+        const top = heights[lz * CHUNK_SIZE + lx] - 6;
+        for (let y = LAVA_LEVEL + 2; y < top; y++) {
+          if (data[blockIndex(lx, y, lz)] !== Block.AIR || data[blockIndex(lx, y + 1, lz)] !== Block.AIR) continue;
+          if (!FULL_CUBE[typeOf(data[blockIndex(lx, y - 1, lz)])]) continue;
+          if (hash3(x, y, z, this.seed + 31) < 0.0012) data[blockIndex(lx, y, lz)] = makeState(Block.TORCH, 0);
+        }
+      }
+  }
+
+  /** Ступенчатая пирамида из песчаника на мелководье, с факелом на вершине: ночью его видно издалека. */
+  private placePyramid(data: Uint16Array, heights: Int16Array, cx: number, cz: number): void {
+    const rx = Math.floor(cx / PYRAMID_REGION);
+    const rz = Math.floor(cz / PYRAMID_REGION);
+    // Несколько попыток на регион: мелководье попадается не везде.
+    for (let k = 0; k < 3; k++) {
+      const h = (n: number) => hash3(rx, k * 8 + n, rz, this.seed + 51);
+      if (h(0) >= 0.4) continue;
+      if (rx * PYRAMID_REGION + Math.floor(h(1) * PYRAMID_REGION) !== cx || rz * PYRAMID_REGION + Math.floor(h(2) * PYRAMID_REGION) !== cz) continue;
+      const lx = 5 + Math.floor(h(3) * 6);
+      const lz = 5 + Math.floor(h(4) * 6);
+      const x = cx * CHUNK_SIZE + lx;
+      const z = cz * CHUNK_SIZE + lz;
+      const height = heights[lz * CHUNK_SIZE + lx];
+      const depth = SEA_LEVEL - height;
+      if (depth < 1 || depth > 3 || this.column(x, z).biome !== Biome.OCEAN) continue;
+      const r = depth + 2;
+      const floor: number[] = [];
+      for (let dz = -r; dz <= r; dz++) for (let dx = -r; dx <= r; dx++) floor.push(heights[(lz + dz) * CHUNK_SIZE + lx + dx]);
+      if (floor.some((y) => y >= SEA_LEVEL)) continue;
+      let n = 0;
+      for (let dz = -r; dz <= r; dz++)
+        for (let dx = -r; dx <= r; dx++) {
+          const top = height + 1 + r - Math.max(Math.abs(dx), Math.abs(dz));
+          for (let y = floor[n++] + 1; y <= top; y++) data[blockIndex(lx + dx, y, lz + dz)] = Block.SANDSTONE;
+        }
+      data[blockIndex(lx, height + 2 + r, lz)] = makeState(Block.TORCH, 0);
+      return;
+    }
+  }
+
+  /** Алтарь: золото 3×3, в центре замшелый булыжник, вокруг и сверху — факелы. */
+  private placeShrine(data: Uint16Array, heights: Int16Array, cx: number, cz: number): void {
+    const rx = Math.floor(cx / SHRINE_REGION);
+    const rz = Math.floor(cz / SHRINE_REGION);
+    const h = (n: number) => hash3(rx, n, rz, this.seed + 61);
+    if (h(0) >= 0.35) return;
+    if (rx * SHRINE_REGION + Math.floor(h(1) * SHRINE_REGION) !== cx || rz * SHRINE_REGION + Math.floor(h(2) * SHRINE_REGION) !== cz) return;
+    const lx = 2 + Math.floor(h(3) * 12);
+    const lz = 2 + Math.floor(h(4) * 12);
+    const x = cx * CHUNK_SIZE + lx;
+    const z = cz * CHUNK_SIZE + lz;
+    const height = heights[lz * CHUNK_SIZE + lx];
+    if (height <= SEA_LEVEL + 1 || height + 4 >= WORLD_HEIGHT) return;
+    const { biome } = this.column(x, z);
+    if (biome === Biome.OCEAN || biome === Biome.BEACH || biome === Biome.MOUNTAINS) return;
+    // Только на ровном месте.
+    for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) if (heights[(lz + dz) * CHUNK_SIZE + lx + dx] !== height) return;
+    for (let dz = -1; dz <= 1; dz++)
+      for (let dx = -1; dx <= 1; dx++) {
+        data[blockIndex(lx + dx, height, lz + dz)] = Block.GOLD_BLOCK;
+        for (let y = height + 1; y <= height + 3; y++) data[blockIndex(lx + dx, y, lz + dz)] = Block.AIR;
+      }
+    data[blockIndex(lx, height + 1, lz)] = Block.MOSSY_COBBLESTONE;
+    data[blockIndex(lx, height + 2, lz)] = makeState(Block.TORCH, 0);
+    for (const [dx, dz] of [
+      [1, 0],
+      [-1, 0],
+      [0, 1],
+      [0, -1],
+    ])
+      data[blockIndex(lx + dx, height + 1, lz + dz)] = makeState(Block.TORCH, 0);
   }
 
   /** Деревья могут свисать в соседние чанки, поэтому перебираем клетки с запасом. */
@@ -247,7 +399,10 @@ export class WorldGenerator {
         const kind: TreeKind =
           biome === Biome.SNOWY || biome === Biome.MOUNTAINS ? 'spruce' : biome === Biome.FOREST && roll < 0.3 ? 'birch' : 'oak';
         const size = hash3(gx, 4, gz, this.seed + 12);
-        placeTree(kind, size, (x, y, z, id, trunk) => setIfFree(data, cx, cz, x, y, z, id, trunk), tx, h + 1, tz);
+        const set: SetBlock = (x, y, z, id, trunk) => setIfFree(data, cx, cz, x, y, z, id, trunk);
+        // Изредка среди живых деревьев стоит мёртвое — без единого листа.
+        if (hash3(gx, 5, gz, this.seed + 12) < 0.05) placeDeadTree(kind, size, set, tx, h + 1, tz);
+        else placeTree(kind, size, set, tx, h + 1, tz);
       }
     }
   }
@@ -298,6 +453,30 @@ function setIfFree(data: Uint16Array, cx: number, cz: number, x: number, y: numb
 }
 
 type SetBlock = (x: number, y: number, z: number, id: number, trunk: boolean) => void;
+
+/** Мёртвое дерево: голый ствол и несколько сухих веток. */
+function placeDeadTree(kind: TreeKind, size: number, set: SetBlock, tx: number, base: number, tz: number): void {
+  const rnd = mulberry32(Math.floor(size * 1e9) ^ Math.imul(tx, 83492791) ^ Math.imul(tz, 2654435761 | 0));
+  const log = kind === 'birch' ? Block.BIRCH_LOG : kind === 'spruce' ? Block.SPRUCE_LOG : Block.OAK_LOG;
+  const trunk = 5 + Math.floor(size * 3);
+  for (let dy = 0; dy < trunk; dy++) set(tx, base + dy, tz, log, true);
+  const dirs = [
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+  ];
+  const branches = 2 + Math.floor(rnd() * 3);
+  for (let i = 0; i < branches; i++) {
+    const [dx, dz] = dirs[Math.floor(rnd() * 4)];
+    const y = base + trunk - 1 - Math.floor(rnd() * 3);
+    const length = 1 + Math.floor(rnd() * 2);
+    // Бревно лежит вдоль ветки: ось X или Z.
+    const branch = makeState(log, dx !== 0 ? 1 : 2);
+    for (let k = 1; k <= length; k++) set(tx + dx * k, y + (k === length && rnd() < 0.5 ? 1 : 0), tz + dz * k, branch, true);
+  }
+  set(tx, base - 1, tz, Block.DIRT, true);
+}
 
 /**
  * Рисует дерево через callback — используется и генератором мира, и ростом

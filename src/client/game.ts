@@ -11,6 +11,7 @@ import { Biome, SNOW_LINE, WorldGenerator } from '../shared/worldgen';
 import { SoundEngine, type SoundName } from './audio';
 import { Avatar } from './avatars';
 import { EntityRenderer } from './entities';
+import { HorrorDirector } from './horror';
 import { createMobModel } from './mobModels';
 import { Input, isTouchDevice } from './input';
 import { PlayerInventory } from './inventory';
@@ -85,6 +86,8 @@ export class Game {
   private readonly overlays: BlockOverlays;
   private readonly rainFx: Rain;
   private readonly hand: FirstPersonHand;
+  /** Херобрин и прочие жуткие события (только у этого игрока). */
+  private readonly horror: HorrorDirector;
   private readonly sound = new SoundEngine(() => new Worker(new URL('./synth.worker.ts', import.meta.url), { type: 'module' }));
   private readonly input: Input;
   private readonly avatars = new Map<number, Avatar>();
@@ -212,6 +215,24 @@ export class Game {
     this.selfAvatar = new Avatar(settings.name, settings.color, welcome.self.p, this.itemMeshes);
     this.selfAvatar.group.visible = false;
     this.scene.add(this.selfAvatar.group);
+    this.horror = new HorrorDirector({
+      scene: this.scene,
+      camera: this.camera,
+      player: this.player,
+      world: this.world,
+      sound: this.sound,
+      ui: this.ui,
+      entities: this.entities,
+      env: this.env,
+      pipeline: this.pipeline,
+      torchLight: this.uniforms.uBlockLight.value,
+      playerName: settings.name,
+      fog: () => [this.uniforms.uFogNear.value, this.uniforms.uFogFar.value],
+      lightColor: (lb, out) => this.lightColor(lb, out),
+      playing: () => this.mode === 'play',
+      firstPerson: () => this.view === 0,
+    });
+    this.horror.setEnabled(settings.horror);
 
     this.sound.setVolume(settings.volume / 100);
     this.sound.setMusicVolume(settings.music / 100);
@@ -482,6 +503,16 @@ export class Game {
       (v) => (v ? `${v}%` : 'выкл'),
     );
 
+    const horror = $('horror');
+    const showHorror = () => (horror.textContent = `Ужасы: ${s.horror ? 'вкл' : 'выкл'}`);
+    showHorror();
+    horror.onclick = () => {
+      s.horror = !s.horror;
+      saveSettings(s);
+      this.horror.setEnabled(s.horror);
+      showHorror();
+    };
+
     const chatInput = $<HTMLInputElement>('chat-input');
     $('chat-form').onsubmit = (e) => {
       e.preventDefault();
@@ -629,10 +660,12 @@ export class Game {
   }
 
   private playerList(): { name: string; color: string }[] {
-    return [
+    const list = [
       { name: `${this.settings.name} (вы)`, color: this.settings.color },
       ...[...this.avatars].map(([id, a]) => ({ name: a.name, color: this.colors.get(id) ?? '#fff' })),
     ];
+    if (this.horror.ghost) list.push({ name: this.horror.ghost, color: '#ffffff' });
+    return list;
   }
 
   private onResize = () => {
@@ -1369,6 +1402,7 @@ export class Game {
       a.update(dt);
     }
     this.entities.update(dt);
+    this.horror.update(dt);
     this.particles.update(dt);
     this.rainFx.intensity = this.rainLevel;
     this.rainFx.update(dt, camera.position);

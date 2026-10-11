@@ -482,7 +482,14 @@ uniform float uSaturation;
 uniform float uUnderwaterTint;
 uniform float uTimeF;
 uniform float uDamage;
+/** Страх: тёмная виньетка, блеклые цвета, зерно. Сбой: рваные строки, расходящиеся цвета, помехи. */
+uniform float uDread;
+uniform float uGlitch;
 varying vec2 vUv;
+
+float hash12(vec2 p) {
+  return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
 
 vec3 aces(vec3 x) {
   const float a = 2.51;
@@ -500,7 +507,15 @@ vec3 toSRGB(vec3 c) {
 void main() {
   vec2 uv = vUv;
   if (uUnderwaterTint > 0.5) uv += vec2(sin(uv.y * 30.0 + uTimeF * 2.0), cos(uv.x * 25.0 + uTimeF * 1.7)) * 0.0025;
-  vec3 col = texture2D(tColor, uv).rgb;
+  vec3 col;
+  if (uGlitch > 0.001) {
+    // Строки изображения рвутся и съезжают, каналы цвета расходятся.
+    float band = floor(uv.y * 42.0 + floor(uTimeF * 23.0) * 7.0);
+    float n = hash12(vec2(band, floor(uTimeF * 31.0)));
+    uv.x += (n - 0.5) * 0.08 * uGlitch * step(0.55, n);
+    float o = 0.008 * uGlitch;
+    col = vec3(texture2D(tColor, uv + vec2(o, 0.0)).r, texture2D(tColor, uv).g, texture2D(tColor, uv - vec2(o, 0.0)).b);
+  } else col = texture2D(tColor, uv).rgb;
 #ifdef GOD_RAYS
   if (uSunVisible > 0.0) {
     // 24 шага со случайным сдвигом на пиксель выглядят как 40 ровных и вдвое дешевле.
@@ -525,7 +540,13 @@ void main() {
   float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));
   col = mix(vec3(luma), col, uSaturation);
   vec2 q = vUv - 0.5;
-  col *= 1.0 - dot(q, q) * 0.55;
+  col *= 1.0 - dot(q, q) * (0.55 + uDread * 1.6);
+  if (uDread + uGlitch > 0.001) {
+    float l = dot(col, vec3(0.2126, 0.7152, 0.0722));
+    col = mix(col, vec3(l) * vec3(0.92, 0.95, 1.0), uDread * 0.55);
+    float grain = hash12(gl_FragCoord.xy + fract(uTimeF * 7.13) * 512.0) - 0.5;
+    col += grain * (0.05 * uDread + 0.26 * uGlitch);
+  }
   if (uUnderwaterTint > 0.5) col = mix(col, col * vec3(0.55, 0.75, 1.0), 0.45);
   col = mix(col, vec3(0.7, 0.0, 0.0), uDamage * smoothstep(0.15, 0.75, length(q)));
   gl_FragColor = vec4(toSRGB(clamp(col, 0.0, 1.0)), 1.0);

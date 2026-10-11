@@ -60,7 +60,17 @@ export type SoundName =
   | 'sheep_say'
   | 'sheep_hurt'
   | 'chicken_say'
-  | 'chicken_hurt';
+  | 'chicken_hurt'
+  | 'horror_sting'
+  | 'horror_heartbeat'
+  | 'horror_whisper'
+  | 'horror_breath'
+  | 'horror_cave'
+  | 'horror_static'
+  | 'horror_scream'
+  | 'horror_music_box'
+  | 'horror_knock'
+  | 'horror_drone';
 
 export interface PlayOptions {
   x?: number;
@@ -782,6 +792,135 @@ function blockSound(s: Synth, group: SoundGroup, act: Action): Float32Array {
 }
 
 // ---------- Таблица звуков ----------
+
+// ---------- Страшные звуки ----------
+
+/** Эхо: звук и count повторов через delay секунд, каждый тише в fb раз и глуше. */
+function echo(s: Synth, x: Float32Array, delay: number, fb: number, count: number, damp = 2500): Float32Array {
+  const out = s.buf(x.length / s.sr + delay * count);
+  s.mix(out, x);
+  let tap = x;
+  for (let k = 1; k <= count; k++) {
+    tap = filter(tap.slice(), s.sr, 'lp', damp / k, 0.6);
+    s.mix(out, tap, delay * k, Math.pow(fb, k));
+  }
+  return out;
+}
+
+/** Слоги: k — номер слога, ph — фаза внутри него (0..1). */
+function syllable(t: number, len: number, count: number): [number, number] {
+  const u = Math.max(0, Math.min(0.9999, t / len)) * count;
+  return [Math.floor(u), u % 1];
+}
+
+/** Неразборчивый шёпот: шум через «гуляющие» форманты гласных, слоги и свистящие. */
+function whisper(s: Synth, len: number): Float32Array {
+  const sr = s.sr;
+  const count = Math.max(3, Math.round(len * s.u(4, 6)));
+  const pts: [number, Formants][] = [];
+  for (let i = 0; i <= count; i++) pts.push([(i / count) * len, s.pick([V.a, V.o, V.u, V.e, V.uh, V.U])]);
+  const F = vowels(pts);
+  const src = s.white(len);
+  const out = s.buf(len);
+  const gains = [1, 0.7, 0.45];
+  for (let j = 0; j < 3; j++) s.mix(out, filter(src.slice(), sr, 'bp', (t) => F(t)[j] * 1.1, 7 + j * 2), 0, gains[j]);
+  const syl = Array.from({ length: count }, () => [s.u(0.35, 1), s.r() < 0.35 ? 1 : 0]);
+  shape(out, sr, (t) => {
+    const [k, ph] = syllable(t, len, count);
+    return Math.pow(Math.sin(Math.PI * ph), 1.5) * syl[k][0];
+  });
+  // Свистящие «с» и «ш» в начале некоторых слогов.
+  const sib = filter(s.white(len), sr, 'hp', 4200, 0.8);
+  shape(sib, sr, (t) => {
+    const [k, ph] = syllable(t, len, count);
+    return syl[k][1] && ph < 0.4 ? Math.sin((Math.PI * ph) / 0.4) * 0.8 : 0.03;
+  });
+  s.mix(out, sib, 0, 0.35);
+  return shape(norm(out), sr, swell(0.12, len, 0.3));
+}
+
+/** Резкий «стингер» — когда Херобрин появляется: диссонансный кластер, визг и удар. */
+function sting(s: Synth): Float32Array {
+  const len = 2.6;
+  const out = s.buf(len);
+  const root = s.u(48, 58);
+  // Низкий кластер: малая секунда, тритон, чистая квинта и октава.
+  for (const ratio of [1, 1.0595, 1.4142, 1.498, 2]) {
+    const f = root * ratio * s.u(0.995, 1.005);
+    s.mix(out, osc(s, len, (t) => f * (1 - 0.06 * t), 'saw'), 0, ratio === 1 ? 0.5 : 0.32);
+  }
+  filter(out, s.sr, 'lp', (t) => 180 + 2600 * Math.exp(-t * 2.2), 1.2);
+  // Визг: две близкие высокие ноты бьются друг о друга.
+  const hi = s.u(1300, 1700);
+  for (const f of [hi, hi * 1.06]) {
+    const x = osc(s, 1.6, (t) => f * (1 + 0.02 * Math.sin(TAU * 7 * t)), 'saw');
+    filter(x, s.sr, 'bp', f * 1.5, 3);
+    s.mix(out, shape(norm(x), s.sr, perc(0.01, 0.45)), 0.02, 0.25);
+  }
+  s.mix(out, noise(s, 0.4, perc(0.002, 0.08), ['bp', 2200, 0.8]), 0, 0.5);
+  s.mix(out, thud(s, 120, 35, 0.25), 0, 0.9);
+  return shape(norm(out), s.sr, ahd(0.01, 0.4, 0.7));
+}
+
+/** Пещерные звуки, как в Minecraft: стоны, гул, скрежет камня, вой ветра, далёкие удары. */
+function caveSound(s: Synth): Float32Array {
+  const sr = s.sr;
+  switch (Math.floor(s.r() * 5)) {
+    case 0: {
+      const len = s.u(3.5, 5);
+      const f = s.u(80, 120);
+      const x = voice(s, len, {
+        f0: (t) => f * (1.05 - (0.35 * t) / len),
+        formants: vowels([
+          [0, V.o],
+          [len * 0.6, V.u],
+          [len, V.U],
+        ]),
+        vib: 3,
+        vibDepth: 0.02,
+        jitter: 0.04,
+        breath: 0.4,
+        growl: 0.4,
+        dry: 0.4,
+        q: [4, 6, 8],
+      });
+      filter(x, sr, 'lp', 1200, 0.7);
+      return echo(s, shape(x, sr, swell(0.8, len, 1.5)), 0.31, 0.45, 4, 1500);
+    }
+    case 1: {
+      const len = s.u(4, 6);
+      const out = s.buf(len);
+      const base = s.u(55, 90);
+      for (const r of [1, 1.5 * s.u(0.99, 1.01), 2.01, 2.67]) {
+        const bend = s.u(-0.12, 0.08);
+        s.mix(out, osc(s, len, (t) => base * r * (1 + (bend * t) / len)), 0, 1 / r);
+      }
+      return echo(s, shape(norm(out), sr, swell(1.2, len, 1.8)), 0.4, 0.4, 3, 900);
+    }
+    case 2: {
+      const len = s.u(2.5, 3.5);
+      const x = dust(s, len, (t) => 300 + 2500 * Math.abs(Math.sin(t * 3.1)), 1.5);
+      filter(x, sr, 'bp', (t) => 500 + 400 * Math.sin(t * 2.3), 2.5);
+      filter(x, sr, 'lp', 2200, 0.7);
+      return echo(s, shape(norm(x), sr, swell(0.3, len, 0.8)), 0.27, 0.4, 3, 1800);
+    }
+    case 3: {
+      const len = s.u(4, 6);
+      const x = s.pink(len);
+      const c = s.u(350, 700);
+      filter(x, sr, 'bp', (t) => c * (1 + 0.35 * Math.sin(t * 1.3 + 1) + 0.15 * Math.sin(t * 3.7)), 14);
+      return shape(norm(x), sr, swell(1.3, len, 1.6));
+    }
+    default: {
+      const len = s.u(3, 4.5);
+      const out = s.brown(len);
+      filter(out, sr, 'lp', 160, 0.8);
+      norm(out, 0.6);
+      for (let t = s.u(0.3, 0.8); t < len - 0.6; t += s.u(0.5, 1.2)) s.mix(out, thud(s, s.u(60, 90), 30, 0.18), t, s.u(0.3, 0.6));
+      return echo(s, shape(out, sr, swell(0.6, len, 1)), 0.35, 0.35, 3, 600);
+    }
+  }
+}
 
 interface SoundDef {
   gen: (s: Synth) => Float32Array;
@@ -1642,6 +1781,131 @@ const OTHER_SOUNDS: Record<Exclude<SoundName, BlockSound>, SoundDef> = {
       return shape(x, s.sr, ahd(0.005, len * 0.35, len * 0.25));
     },
     { vars: 3, jitter: 0.1, rate: 0.5 },
+  ),
+
+  // ---- хоррор ----
+  horror_sting: def(0.9, (s) => echo(s, sting(s), 0.23, 0.35, 3), { vars: 2, jitter: 0.02, drive: 0.6 }),
+  // Сердцебиение: «тук-тук».
+  horror_heartbeat: def(
+    0.85,
+    (s) => {
+      const out = s.buf(0.75);
+      s.mix(out, thud(s, s.u(70, 85), 38, 0.07), 0, 1);
+      s.mix(out, thud(s, s.u(60, 72), 34, 0.06), s.u(0.2, 0.26), 0.7);
+      return filter(out, s.sr, 'lp', 220, 0.7);
+    },
+    { vars: 3, jitter: 0.03, rate: 0.5 },
+  ),
+  horror_whisper: def(0.55, (s) => echo(s, whisper(s, s.u(1.4, 2.4)), 0.12, 0.25, 2, 3500), { vars: 4, jitter: 0.05 }),
+  // Тяжёлое дыхание за спиной: вдох, выдох с хрипом.
+  horror_breath: def(
+    0.5,
+    (s) => {
+      const inhale = s.u(0.9, 1.3);
+      const exhale = s.u(1.1, 1.6);
+      const out = s.buf(inhale + exhale + 0.4);
+      s.mix(out, noise(s, inhale, swell(0.5, inhale, 0.25), ['bp', (t) => 900 + (600 * t) / inhale, 1.2], ['hp', 300]), 0, 0.6);
+      s.mix(out, noise(s, exhale, swell(0.12, exhale, 0.7), ['bp', (t) => 700 - (250 * t) / exhale, 1], ['hp', 200]), inhale + 0.15, 1);
+      const growl = voice(s, exhale, { f0: s.u(60, 75), formants: () => V.uh, breath: 2.5, growl: 0.6, q: [3, 4, 5] });
+      s.mix(out, shape(growl, s.sr, swell(0.2, exhale, 0.6)), inhale + 0.15, 0.25);
+      return out;
+    },
+    { vars: 2, jitter: 0.04, rate: 0.5 },
+  ),
+  horror_cave: def(0.7, caveSound, { vars: 6, jitter: 0.05, rate: 0.5 }),
+  // Помехи, как у сломанного радио: рваный шум, треск и гудение сети.
+  horror_static: def(
+    0.45,
+    (s) => {
+      const len = s.u(0.5, 0.9);
+      const x = s.white(len);
+      filter(x, s.sr, 'bp', 2600, 0.5);
+      s.mix(x, dust(s, len, 900, 1), 0, 1.5);
+      s.mix(x, osc(s, len, 50, 'square'), 0, 0.15);
+      const gates = Array.from({ length: 12 }, () => (s.r() < 0.75 ? s.u(0.5, 1) : 0.05));
+      return shape(norm(x), s.sr, (t) => gates[Math.min(11, Math.floor((t / len) * 12))] * Math.min(1, t / 0.01, Math.max(0, len - t) / 0.02));
+    },
+    { vars: 2, jitter: 0.08 },
+  ),
+  // Далёкий крик: высокие частоты съедены расстоянием, долгое эхо.
+  horror_scream: def(
+    0.5,
+    (s) => {
+      const len = s.u(1.4, 2);
+      const f = s.u(330, 420);
+      const x = voice(s, len, {
+        f0: (t) => f * (1 + 0.35 * Math.sin(Math.PI * Math.min(1, t / (len * 0.7)))) * (t > len * 0.7 ? 1 - (0.3 * (t - len * 0.7)) / (len * 0.3) : 1),
+        formants: vowels([
+          [0, V.e],
+          [len * 0.2, V.a],
+          [len, V.a],
+        ]),
+        vib: 6,
+        vibDepth: 0.04,
+        jitter: 0.05,
+        breath: 0.25,
+        growl: 0.15,
+        q: [6, 8, 10],
+      });
+      filter(x, s.sr, 'lp', 1700, 0.7);
+      return echo(s, shape(x, s.sr, swell(0.08, len, 0.5)), 0.42, 0.45, 4, 1400);
+    },
+    { vars: 2, jitter: 0.06 },
+  ),
+  // Сломанная музыкальная шкатулка: минорный мотив, всё медленнее и всё фальшивее.
+  horror_music_box: def(
+    0.4,
+    (s) => {
+      const scale = [0, 2, 3, 5, 7, 8, 11, 12];
+      const base = 72 + Math.floor(s.u(0, 5));
+      const motif = [0, 4, 2, 4, 5, 4, 2, 1, 0];
+      const out = s.buf(6.5);
+      let t = 0.02;
+      motif.forEach((i, k) => {
+        const f = midiHz(base + scale[i]) * (1 - 0.004 * k * k * s.u(0.5, 1));
+        mode(out, s.sr, t, f, 0.5, 0.6);
+        mode(out, s.sr, t, f * 2.76, 0.12, 0.2);
+        mode(out, s.sr, t, f * 5.4, 0.05, 0.08);
+        t += 0.28 + 0.012 * k * k;
+      });
+      return echo(s, norm(out), 0.21, 0.3, 2, 3000);
+    },
+    { vars: 2, jitter: 0.01 },
+  ),
+  // Стук в дерево: три-четыре удара.
+  horror_knock: def(
+    0.7,
+    (s) => {
+      const out = s.buf(1.6);
+      const n = s.r() < 0.5 ? 3 : 4;
+      let t = 0.02;
+      for (let i = 0; i < n; i++) {
+        knock(s, out, t, s.u(110, 150), 1, 0.05, 0.8);
+        s.mix(out, tick(s, 1800, 1.2, 0.002), t, 0.3);
+        t += s.u(0.24, 0.34);
+      }
+      return norm(out);
+    },
+    { vars: 2, jitter: 0.04 },
+  ),
+  // Низкий гул, пока Херобрин смотрит.
+  horror_drone: def(
+    0.5,
+    (s) => {
+      const len = 8;
+      const out = s.buf(len);
+      const base = s.u(36, 44);
+      for (const [r, g] of [
+        [1, 1],
+        [1.007, 0.8],
+        [1.5, 0.35],
+        [2.12, 0.25],
+      ])
+        s.mix(out, osc(s, len, (t) => base * r * (1 + 0.01 * Math.sin(t * 0.7 * r)), 'saw'), 0, g);
+      filter(out, s.sr, 'lp', (t) => 220 + 140 * Math.sin(t * 0.5), 0.9);
+      return shape(norm(out), s.sr, swell(2.5, len, 3));
+    },
+    { vars: 2, jitter: 0, rate: 0.5 },
   ),
 };
 
@@ -2677,7 +2941,8 @@ export class SoundEngine {
     const ctx = this.ctx;
     if (this.warm || this.disposed || ctx?.state !== 'running') return;
     this.warm = true;
-    for (let v = 0; v < 4; v++) for (const name of SOUND_NAMES) if (v < DEFS[name].vars) this.variant(name, v, false);
+    const most = Math.max(...SOUND_NAMES.map((name) => DEFS[name].vars));
+    for (let v = 0; v < most; v++) for (const name of SOUND_NAMES) if (v < DEFS[name].vars) this.variant(name, v, false);
     const sr = this.rate;
     this.synth?.request(`rain:${sr}`, { kind: 'rain', rate: sr }, false, (ch) => {
       this.rainBuffers ??= [toBuffer(ctx, ch.slice(0, 2), sr), toBuffer(ctx, ch.slice(2, 4), sr)];

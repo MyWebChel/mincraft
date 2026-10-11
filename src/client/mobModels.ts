@@ -50,6 +50,11 @@ export function createMobModel(type: MobType): MobModel {
   return new Mob(type);
 }
 
+/** Херобрин; fade — прозрачность тела (0..1), glowFade — светящихся глаз. */
+export function createHerobrineModel(): MobModel & { fade: number; glowFade: number } {
+  return new Mob('herobrine');
+}
+
 // ───────────────────────────── константы и утилиты ─────────────────────────────
 
 /** Один пиксель модели в блоках. */
@@ -341,10 +346,10 @@ class Rig {
   }
 
   /** Неосвещаемый материал светящихся глаз (MeshBasicMaterial). */
-  glow(): THREE.MeshBasicMaterial {
+  glow(color: THREE.Color = EYE_GLOW): THREE.MeshBasicMaterial {
     const m = new THREE.MeshBasicMaterial({
       map: this.map,
-      color: EYE_GLOW,
+      color,
       alphaTest: 0.5,
       alphaHash: true,
       polygonOffset: true,
@@ -789,6 +794,76 @@ function spider(s: Skin): Rigger {
   };
 }
 
+/** Глаза Херобрина: ярче глаз паука — в темноте и тумане видны только они. */
+const HEROBRINE_EYES = new THREE.Color(4, 4, 4);
+
+/**
+ * Херобрин: человек в голубой футболке и синих штанах, но с белыми глазами без зрачков.
+ * Стоит неподвижно, руки опущены, голова всегда повёрнута к игроку.
+ */
+function herobrine(s: Skin): Rigger {
+  const skin = hex('#b5876c');
+  const skinD = hex('#9a6f57');
+  const hair = hex('#3a2416');
+  const hairL = hex('#4a2f1d');
+  const shirt = hex('#1f9d9e');
+  const shirtD = hex('#178182');
+  const pants = hex('#3b3a97');
+  const pantsD = hex('#2d2c78');
+  const shoe = hex('#4a4950');
+  const white = hex('#ffffff');
+  const eyes = art(['', '', '', '', '.ww..ww.'], { w: white });
+  const face = art(['hhhhhhhh', 'hHhhhhHh', 'h......h', '', '', '...nn...', '..mmmm..'], {
+    h: hair,
+    H: hairL,
+    n: hex('#8e6450'),
+    m: hex('#6b4434'),
+  });
+
+  const head = s.box(8, 8, 8, (f, x, y) => {
+    if (f === 'front') return eyes(x, y) ?? face(x, y) ?? s.n(skin, 0.06);
+    if (f === 'top') return s.n(s.rnd() < 0.2 ? hairL : hair, 0.1);
+    if (f === 'bottom') return s.n(skinD, 0.06);
+    if (f === 'back') return s.n(y < 6 ? hair : skinD, 0.08);
+    return s.n(y < 2 || (y === 2 && x > 1) ? hair : skin, 0.07);
+  });
+  const body = s.box(8, 12, 4, (f, x, y) => {
+    if (f === 'front' && y === 0 && x >= 3 && x <= 4) return s.n(skin, 0.05);
+    return s.n(s.rnd() < 0.12 ? shirtD : shirt, 0.07);
+  });
+  // Короткие рукава футболки, дальше — кожа.
+  const arm = s.box(4, 12, 4, (f, _x, y) => {
+    if (f === 'bottom') return s.n(skinD, 0.06);
+    return s.n(y < 4 && f !== 'top' ? shirt : f === 'top' ? shirt : y === 11 ? skinD : skin, 0.07);
+  });
+  const leg = s.box(4, 12, 4, (f, _x, y) => s.n(f === 'bottom' || y >= 10 ? shoe : s.rnd() < 0.1 ? pantsD : pants, 0.07));
+  const glow = s.rect(8, 8, (x, y) => eyes(x, y) ?? null);
+
+  const gHead = merge(cube(head, 0, 4, 0));
+  const gEyes = decal(glow, 0, 4, -4.05);
+  const gBody = merge(cube(body, 0, 0, 0));
+  const gArm = merge(cube(arm, 0, -4, 0));
+  const gLeg = merge(cube(leg, 0, -6, 0));
+
+  return (r) => {
+    r.part(gBody, 0, 18, 0);
+    const h = r.part(gHead, 0, 24, 0);
+    r.part(gEyes, 0, 0, 0, h, r.glow(HEROBRINE_EYES)).castShadow = false;
+    const arms = [r.part(gArm, 6, 22, 0), r.part(gArm, -6, 22, 0)];
+    const legs = [r.part(gLeg, 1.9, 12, 0), r.part(gLeg, -1.9, 12, 0)];
+    return (p) => {
+      look(h, p);
+      const sw = swing(p);
+      legs[0].rotation.x = sw;
+      legs[1].rotation.x = -sw;
+      // Руки висят вдоль тела, лишь едва заметно покачиваются.
+      const [bobX, bobZ] = armBob(p.time || 0);
+      arms[0].rotation.set(-sw * 0.6 + bobX * 0.4, 0, bobZ * 0.3);
+      arms[1].rotation.set(sw * 0.6 - bobX * 0.4, 0, -bobZ * 0.3);
+    };
+  };
+}
+
 // ───────────────────────────── реестр типов ─────────────────────────────
 
 interface Kind {
@@ -801,7 +876,10 @@ interface Kind {
   build: (s: Skin) => Rigger;
 }
 
-const KINDS: Record<MobType, Kind> = {
+/** Модели: мобы мира и Херобрин (он только на стороне игрока, сервер о нём не знает). */
+type ModelType = MobType | 'herobrine';
+
+const KINDS: Record<ModelType, Kind> = {
   pig: { height: 1, lift: 5, build: pig },
   cow: { height: 1.5, lift: 6, build: cow },
   sheep: { height: 1.4, lift: 5, build: sheep },
@@ -810,6 +888,7 @@ const KINDS: Record<MobType, Kind> = {
   skeleton: { height: 2, lift: 4, cutout: true, build: skeleton },
   creeper: { height: 1.65, lift: 4, build: creeper },
   spider: { height: 0.85, lift: 5, build: spider },
+  herobrine: { height: 2, lift: 4, build: herobrine },
 };
 
 interface Assets {
@@ -818,9 +897,9 @@ interface Assets {
 }
 
 /** Текстура и геометрия типа создаются один раз и живут всю игру (они крошечные). */
-const assets = new Map<MobType, Assets>();
+const assets = new Map<ModelType, Assets>();
 
-function loadAssets(type: MobType): Assets {
+function loadAssets(type: ModelType): Assets {
   let a = assets.get(type);
   if (!a) {
     const skin = new Skin(mulberry32(nameSeed(`mob:${type}`)));
@@ -855,8 +934,11 @@ class Mob implements MobModel {
   private readonly swells: boolean;
   /** Фаза мигания крипера (0..1, вторая половина — белая вспышка). */
   private flashPhase = 0;
+  /** Прозрачность тела и светящихся глаз сверх анимации смерти (Херобрин растворяется в тумане, в темноте видны одни глаза). */
+  fade = 1;
+  glowFade = 1;
 
-  constructor(type: MobType) {
+  constructor(type: ModelType) {
     this.kind = KINDS[type];
     this.height = this.kind.height;
     this.swells = type === 'creeper';
@@ -908,7 +990,7 @@ class Mob implements MobModel {
 
     // Растворение в последней трети анимации смерти.
     const opacity = death > 0.7 ? 1 - (death - 0.7) / 0.3 : 1;
-    for (const m of this.rig.materials) m.opacity = opacity;
+    for (const m of this.rig.materials) m.opacity = opacity * (m instanceof THREE.MeshBasicMaterial ? this.glowFade : this.fade);
   }
 
   dispose(): void {

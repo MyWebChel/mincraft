@@ -140,6 +140,10 @@ export class Game {
   private playTime = 0;
   /** Когда последний раз понижали разрешение (по elapsed) — повышаем не раньше чем через 20 с. */
   private lastDownscale = -Infinity;
+  /** Пробное понижение разрешения: с какой доли и какой был средний кадр до него. */
+  private downscaleTrial: { from: number; mean: number } | null = null;
+  /** До этого момента (по elapsed) разрешение не трогаем: недавно выяснили, что оно не помогает. */
+  private resolutionHoldUntil = 0;
 
   constructor(
     private readonly conn: Connection,
@@ -208,6 +212,7 @@ export class Game {
         return biome === Biome.SNOWY || (biome === Biome.MOUNTAINS && y > SNOW_LINE - 8) ? 2 : 1;
       },
     );
+    this.pipeline.onResolution = this.updatePixelScale;
     this.hand = new FirstPersonHand(this.pipeline.handScene, this.itemMeshes, settings.color);
     this.entities = new EntityRenderer(this.scene, this.itemMeshes, this.world, this.particles, (lb, out) => this.lightColor(lb, out));
     for (const e of welcome.entities) this.entities.spawn(e);
@@ -554,6 +559,10 @@ export class Game {
    * Держим плавные ~45+ FPS: по медиане длительности кадра сначала понижаем разрешение
    * (до половины), а если и этого мало — качество графики на ступень (пока игрок не выбрал
    * его сам). Когда запас появился, разрешение понемногу возвращаем.
+   *
+   * Каждое понижение — проба: если кадры не стали быстрее, упирается не видеокарта
+   * (а процессор или браузер, который в режиме энергосбережения держит 30 FPS), и мыло
+   * ничего не даёт — разрешение возвращаем и минуту его не трогаем.
    */
   private trackPerformance(frameMs: number, dt: number): void {
     // Пока мир активно подгружается, кадры неровные не из-за видеокарты — не замеряем.
@@ -567,11 +576,23 @@ export class Game {
     if (this.perfFrames.length < 60) return;
     const sorted = this.perfFrames.sort((a, b) => a - b);
     const median = sorted[sorted.length >> 1];
+    // Средний кадр чувствует и частичный выигрыш: кадры привязаны к частоте экрана (16.7 / 33.3 мс),
+    // и после понижения сначала меняется их смесь, а не медиана.
+    const mean = sorted.reduce((a, b) => a + b, 0) / sorted.length;
     this.perfFrames.length = 0;
     const scale = this.pipeline.scale;
+    const trial = this.downscaleTrial;
+    this.downscaleTrial = null;
+    if (trial && mean > trial.mean * 0.95) {
+      this.pipeline.setRenderScale(trial.from);
+      this.resolutionHoldUntil = this.elapsed + 60;
+      return;
+    }
     if (median > 22) {
+      if (this.elapsed < this.resolutionHoldUntil) return;
       this.lastDownscale = this.elapsed;
       if (scale > 0.55) {
+        this.downscaleTrial = { from: scale, mean };
         this.pipeline.setRenderScale(scale - (median > 40 ? 0.2 : 0.1));
         return;
       }
@@ -670,6 +691,11 @@ export class Game {
 
   private onResize = () => {
     this.pipeline.resize(window.innerWidth, window.innerHeight);
+    this.updatePixelScale();
+  };
+
+  /** Размер частиц и капель в пикселях зависит от разрешения рендера — в том числе динамического. */
+  private updatePixelScale = () => {
     const scale = window.innerHeight * this.pipeline.renderer.getPixelRatio();
     this.particles.setPixelScale(scale);
     this.rainFx.setPixelScale(scale);

@@ -47,6 +47,8 @@ vec3 applyFog(vec3 col, vec3 world) {
   }
   float f = smoothstep(uFogNear, uFogFar, dist);
   f = max(f, uRain * 0.35 * smoothstep(0.0, uFogFar, dist));
+  // Большая часть экрана ближе тумана — цвет неба там не нужен.
+  if (f <= 0.0) return col;
   return mix(col, skyColor(v / max(dist, 1e-4)), f);
 }
 `;
@@ -462,7 +464,7 @@ void main() {
 }
 `;
 
-/** Финальный проход: god rays, тонмаппинг ACES, цветокоррекция, виньетка, sRGB. */
+/** Полноэкранные проходы: финальный, свечение, лучи. */
 export const FINAL_VERTEX = /* glsl */ `
 varying vec2 vUv;
 void main() {
@@ -471,12 +473,92 @@ void main() {
 }
 `;
 
-export const FINAL_FRAGMENT = /* glsl */ `
-uniform sampler2D tColor;
+/**
+ * Свечение, шаг вниз (dual filter): 5 билинейных выборок покрывают 4×4 текселя источника.
+ * На первом шаге оставляем только яркое — выше порога.
+ */
+export const BLOOM_DOWN_FRAGMENT = /* glsl */ `
+uniform sampler2D tSrc;
+uniform vec2 uTexel;
+uniform float uThreshold;
+uniform float uPrefilter;
+varying vec2 vUv;
+void main() {
+  vec3 c = texture2D(tSrc, vUv).rgb * 4.0;
+  c += texture2D(tSrc, vUv - uTexel).rgb;
+  c += texture2D(tSrc, vUv + uTexel).rgb;
+  c += texture2D(tSrc, vUv + vec2(uTexel.x, -uTexel.y)).rgb;
+  c += texture2D(tSrc, vUv - vec2(uTexel.x, -uTexel.y)).rgb;
+  c *= 0.125;
+  if (uPrefilter > 0.5) c *= smoothstep(uThreshold, uThreshold + 0.1, dot(c, vec3(0.299, 0.587, 0.114)));
+  gl_FragColor = vec4(c, 1.0);
+}
+`;
+
+/**
+ * Свечение, шаг вверх: «палатка» 3×3 из меньшей ступени прибавляется (смешиванием) к большей.
+ * Билинейная выборка между четырьмя текселями — это уже среднее 2×2, поэтому палатка 3×3
+ * точно собирается из четырёх выборок со сдвигом на полтекселя вместо девяти.
+ */
+export const BLOOM_UP_FRAGMENT = /* glsl */ `
+uniform sampler2D tSrc;
+uniform vec2 uTexel;
+varying vec2 vUv;
+void main() {
+  vec2 h = uTexel * 0.5;
+  vec3 c = texture2D(tSrc, vUv + h).rgb + texture2D(tSrc, vUv - h).rgb;
+  c += texture2D(tSrc, vUv + vec2(h.x, -h.y)).rgb + texture2D(tSrc, vUv - vec2(h.x, -h.y)).rgb;
+  gl_FragColor = vec4(c * 0.25, 1.0);
+}
+`;
+
+/**
+ * Лучи солнца в четверть разрешения: от пикселя к солнцу ищем открытое небо по глубине.
+ * Лучи размытые сами по себе, поэтому в 16 раз меньше пикселей выглядит так же.
+ */
+export const RAYS_FRAGMENT = /* glsl */ `
 uniform sampler2D tDepth;
 uniform vec2 uSunScreen;
+varying vec2 vUv;
+void main() {
+  float fall = 1.0 - smoothstep(0.0, 0.9, length((vUv - uSunScreen) * vec2(1.0, 0.6)));
+  if (fall <= 0.0) {
+    gl_FragColor = vec4(0.0);
+    return;
+  }
+  // Шаги со случайным сдвигом на пиксель (interleaved gradient noise) — без полос.
+  const int STEPS = 32;
+  vec2 delta = (uSunScreen - vUv) / float(STEPS);
+  float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+  vec2 p = vUv + delta * jitter;
+  float acc = 0.0;
+  float w = 1.0;
+  for (int i = 0; i < STEPS; i++) {
+    p += delta;
+    acc += (texture2D(tDepth, clamp(p, 0.0, 1.0)).r >= 0.99999 ? 1.0 : 0.0) * w;
+    w *= 0.956;
+  }
+  gl_FragColor = vec4(acc / float(STEPS) * fall * 0.9, 0.0, 0.0, 1.0);
+}
+`;
+
+/**
+ * Финальный проход: лучи и свечение, тонмаппинг ACES, цветокоррекция, виньетка, sRGB.
+ * Если картинку растягивает браузер (рендер меньше экрана) — возвращаем резкость.
+ */
+export const FINAL_FRAGMENT = /* glsl */ `
+uniform sampler2D tColor;
+uniform vec2 uTexel;
+uniform float uSharpness;
+#ifdef BLOOM
+uniform sampler2D tBloom;
+uniform float uBloomStrength;
+#endif
+#ifdef GOD_RAYS
+uniform sampler2D tRays;
 uniform float uSunVisible;
 uniform vec3 uRayColor;
+#endif
 uniform float uExposure;
 uniform float uSaturation;
 uniform float uUnderwaterTint;
@@ -515,25 +597,34 @@ void main() {
     uv.x += (n - 0.5) * 0.08 * uGlitch * step(0.55, n);
     float o = 0.008 * uGlitch;
     col = vec3(texture2D(tColor, uv + vec2(o, 0.0)).r, texture2D(tColor, uv).g, texture2D(tColor, uv - vec2(o, 0.0)).b);
-  } else col = texture2D(tColor, uv).rgb;
-#ifdef GOD_RAYS
-  if (uSunVisible > 0.0) {
-    // 24 шага со случайным сдвигом на пиксель выглядят как 40 ровных и вдвое дешевле.
-    const int STEPS = 24;
-    vec2 delta = (uSunScreen - uv) / float(STEPS);
-    float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
-    vec2 p = uv + delta * jitter;
-    float acc = 0.0;
-    float w = 1.0;
-    for (int i = 0; i < STEPS; i++) {
-      p += delta;
-      float d = texture2D(tDepth, clamp(p, 0.0, 1.0)).r;
-      acc += (d >= 0.99999 ? 1.0 : 0.0) * w;
-      w *= 0.942;
+  } else {
+    col = texture2D(tColor, uv).rgb;
+    if (uSharpness > 0.0) {
+      // Адаптивная резкость (как AMD CAS): чем мягче переход, тем сильнее; жёсткие края
+      // почти не трогаем, поэтому ореолов нет. Считаем в сжатой яркости c/(1+c): в HDR
+      // солнце в десятки раз ярче неба и оставило бы вокруг себя тёмную кайму.
+      vec3 c = col / (1.0 + col);
+      vec3 n = texture2D(tColor, uv + vec2(0.0, uTexel.y)).rgb;
+      vec3 s = texture2D(tColor, uv - vec2(0.0, uTexel.y)).rgb;
+      vec3 e = texture2D(tColor, uv + vec2(uTexel.x, 0.0)).rgb;
+      vec3 w = texture2D(tColor, uv - vec2(uTexel.x, 0.0)).rgb;
+      n /= 1.0 + n;
+      s /= 1.0 + s;
+      e /= 1.0 + e;
+      w /= 1.0 + w;
+      vec3 lo = min(c, min(min(n, s), min(e, w)));
+      vec3 hi = max(c, max(max(n, s), max(e, w)));
+      vec3 amp = sqrt(clamp(min(lo, 1.0 - hi) / max(hi, vec3(1e-4)), 0.0, 1.0));
+      vec3 k = -amp * uSharpness;
+      c = clamp((c + (n + s + e + w) * k) / (1.0 + 4.0 * k), 0.0, 0.999);
+      col = c / (1.0 - c);
     }
-    float fall = 1.0 - smoothstep(0.0, 0.9, length((uv - uSunScreen) * vec2(1.0, 0.6)));
-    col += uRayColor * acc / float(STEPS) * uSunVisible * fall * 0.9;
   }
+#ifdef BLOOM
+  col += texture2D(tBloom, uv).rgb * uBloomStrength;
+#endif
+#ifdef GOD_RAYS
+  col += uRayColor * texture2D(tRays, uv).r * uSunVisible;
 #endif
   col *= uExposure;
   col = aces(col);
@@ -549,6 +640,9 @@ void main() {
   }
   if (uUnderwaterTint > 0.5) col = mix(col, col * vec3(0.55, 0.75, 1.0), 0.45);
   col = mix(col, vec3(0.7, 0.0, 0.0), uDamage * smoothstep(0.15, 0.75, length(q)));
-  gl_FragColor = vec4(toSRGB(clamp(col, 0.0, 1.0)), 1.0);
+  // Шум в полшага яркости (interleaved gradient noise): плавные градиенты неба без «ступенек».
+  float dither = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+  vec3 srgb = toSRGB(clamp(col, 0.0, 1.0)) + (dither - 0.5) / 255.0;
+  gl_FragColor = vec4(srgb, 1.0);
 }
 `;

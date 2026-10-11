@@ -66,7 +66,10 @@ export class Environment {
     });
     this.dome = new THREE.Mesh(new THREE.SphereGeometry(500, 32, 16), skyMaterial);
     this.dome.frustumCulled = false;
-    this.dome.renderOrder = -1000;
+    // Небо лежит на дальней плоскости, поэтому рисуем его после блоков и мобов: тест глубины
+    // отбрасывает всё, что ими закрыто, и шейдер неба считается только для видимого неба.
+    // Но до облаков (renderOrder 1): их предварительный проход пишет глубину.
+    this.dome.renderOrder = 0.5;
     scene.add(this.dome);
   }
 

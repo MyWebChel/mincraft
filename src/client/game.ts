@@ -11,7 +11,7 @@ import { Biome, SNOW_LINE, WorldGenerator } from '../shared/worldgen';
 import { SoundEngine, type SoundName } from './audio';
 import { Avatar } from './avatars';
 import { EntityRenderer } from './entities';
-import { HorrorDirector } from './horror';
+import { HORROR_LEVELS, HorrorDirector } from './horror';
 import { createMobModel } from './mobModels';
 import { Input, isTouchDevice } from './input';
 import { PlayerInventory } from './inventory';
@@ -232,7 +232,7 @@ export class Game {
       playing: () => this.mode === 'play',
       firstPerson: () => this.view === 0,
     });
-    this.horror.setEnabled(settings.horror);
+    this.horror.setLevel(settings.horror);
 
     this.sound.setVolume(settings.volume / 100);
     this.sound.setMusicVolume(settings.music / 100);
@@ -504,12 +504,12 @@ export class Game {
     );
 
     const horror = $('horror');
-    const showHorror = () => (horror.textContent = `Ужасы: ${s.horror ? 'вкл' : 'выкл'}`);
+    const showHorror = () => (horror.textContent = `Ужасы: ${HORROR_LEVELS[s.horror]}`);
     showHorror();
     horror.onclick = () => {
-      s.horror = !s.horror;
+      s.horror = (s.horror + 1) % HORROR_LEVELS.length;
       saveSettings(s);
-      this.horror.setEnabled(s.horror);
+      this.horror.setLevel(s.horror);
       showHorror();
     };
 

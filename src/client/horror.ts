@@ -53,6 +53,10 @@ interface Appearance {
   awayTime: number;
   /** Подсказка звуком уже была (если игрок долго его не замечает). */
   cued: boolean;
+  /** Когда (age) перейти на новое место, если игрок его так и не заметил. */
+  moveAt: number;
+  /** Стоит в пещере. */
+  cave: boolean;
   /** До следующего удара сердца. */
   beat: number;
   /** Последний шаг «подходящего» Херобрина — он прямо перед игроком. */
@@ -66,6 +70,10 @@ interface Appearance {
 
 /** Высота глаз Херобрина над ступнями. */
 const EYES = 1.72;
+/** Как часто происходит жуткое (кнопка «Ужасы» в меню паузы). */
+export const HORROR_LEVELS = ['выкл', 'иногда', 'часто', 'постоянно'] as const;
+/** Во сколько раз длиннее паузы между событиями на каждом уровне. */
+const PACE = [1, 1.8, 1, 0.5];
 const HEROBRINE = 'Herobrine';
 const HEROBRINE_COLOR = '#ffffff';
 
@@ -104,6 +112,18 @@ const smoothstep = (a: number, b: number, x: number) => {
   const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
   return t * t * (3 - 2 * t);
 };
+
+/** Случайное событие с учётом весов; не получилось (нет мобов, дверей, места) — пробуем другое. */
+function pickEvent(options: [number, () => boolean][]): boolean {
+  while (options.length) {
+    let r = Math.random() * options.reduce((sum, [w]) => sum + w, 0);
+    let i = 0;
+    while (i < options.length - 1 && (r -= options[i][0]) > 0) i++;
+    if (options[i][1]()) return true;
+    options.splice(i, 1);
+  }
+  return false;
+}
 
 /** «Искажённый» текст: к буквам липнут диакритические знаки. */
 function zalgo(text: string, amount: number): string {
@@ -168,13 +188,14 @@ function glowTexture(): THREE.Texture {
 export class HorrorDirector {
   /** Несуществующий игрок в списке Tab (или null). */
   ghost: string | null = null;
-  private enabled = true;
+  /** Индекс в HORROR_LEVELS; 0 — выключено. */
+  private level = 2;
   /** Время игры: идёт, только пока игрок играет (не в меню). */
   private clock = 0;
-  private nextEvent = rand(40, 70);
+  private nextEvent = rand(25, 45);
   private nextHero = 0;
-  private nextAmbient = rand(25, 45);
-  private nextFace = 600;
+  private nextAmbient = rand(20, 40);
+  private nextFace = 300;
   /** Игрок уже видел Херобрина вдали (до этого он появляется первым делом). */
   private seenHim = false;
   private heroFails = 0;
@@ -260,14 +281,26 @@ export class HorrorDirector {
   }
 
   get isEnabled(): boolean {
-    return this.enabled;
+    return this.level > 0;
   }
 
-  setEnabled(on: boolean): void {
-    if (this.enabled === on) return;
-    this.enabled = on;
-    if (on) {
-      this.nextEvent = Math.max(this.nextEvent, this.clock + rand(40, 70));
+  private get enabled(): boolean {
+    return this.level > 0;
+  }
+
+  /** Множитель пауз между событиями. */
+  private get pace(): number {
+    return PACE[this.level];
+  }
+
+  setLevel(level: number): void {
+    level = Math.max(0, Math.min(HORROR_LEVELS.length - 1, Math.round(level) || 0));
+    if (level === this.level) return;
+    this.level = level;
+    if (level > 0) {
+      // Включили или поменяли частоту — первое событие вскоре.
+      this.nextEvent = this.clock + rand(25, 45) * this.pace;
+      this.nextHero = Math.min(this.nextHero, this.nextEvent);
       return;
     }
     this.vanish(false);
@@ -327,40 +360,30 @@ export class HorrorDirector {
     if (env.bloodTarget > 0) k *= 0.6;
     if (env.fogTarget > 0) k *= 0.8;
     if (this.underground) k *= 0.85;
-    return rand(45, 110) * k;
+    return rand(25, 55) * k * this.pace;
   }
 
   private startEvent(): void {
-    // Первым делом — Херобрин вдали: ради него всё и затевалось.
-    if (!this.seenHim && this.clock >= this.nextHero && this.heroFails < 8) {
-      if (this.watch(this.underground) || (!this.underground && this.approach())) {
-        this.heroFails = 0;
-        this.nextEvent = this.clock + this.cooldown();
-      } else {
-        // Подходящего места пока нет (стены, вода) — скоро попробуем снова.
-        this.heroFails++;
-        this.nextEvent = this.clock + 6;
-      }
-      return;
-    }
-    this.heroFails = 0;
     this.nextEvent = this.clock + this.cooldown();
+    // Херобрин приходит, как только подошёл его черёд; между его появлениями — всё остальное.
+    if (this.clock >= this.nextHero) {
+      if (this.heroEvent()) {
+        this.heroFails = 0;
+        return;
+      }
+      // Подходящего места пока нет (стены, вода) — скоро попробуем снова.
+      if (++this.heroFails < 8) {
+        this.nextEvent = this.clock + 6;
+        return;
+      }
+      this.heroFails = 0;
+    }
     const env = this.host.env;
     const night = env.night > 0.5;
-    const dark = 1 - Math.max((this.sky / 15) * env.daylight, this.blk / 15) > 0.65;
-    const fp = this.host.firstPerson();
-    const heroReady = this.clock >= this.nextHero;
     const options: [number, () => boolean][] = [];
     const add = (weight: number, fn: () => boolean) => {
       if (weight > 0) options.push([weight, fn]);
     };
-    if (heroReady) {
-      add(this.underground ? 5 : 6, () => this.watch(this.underground));
-      add(this.underground || (night && dark) ? 3 : 0, () => this.eyes());
-      add(this.underground ? 0 : night ? 3 : 1.5, () => this.approach());
-      add(fp ? 2.5 : 0, () => this.behind());
-      add(fp ? 0.7 : 0, () => this.turnAround());
-    }
     add(night && this.clock >= this.nextFace ? 0.6 : 0, () => this.faceEvent());
     add(this.ghost ? 0 : 2, () => this.fakeJoin());
     add(1.2, () => this.creepyChat());
@@ -374,14 +397,26 @@ export class HorrorDirector {
     add(night || this.underground || this.indoors ? 1 : 0.3, () => this.musicBox());
     add(1.5, () => this.whisper());
     add(0.8, () => this.staticBurst());
-    // Событие может не случиться (нет мобов, дверей, места) — тогда берём другое.
-    for (let tries = 0; tries < 6 && options.length; tries++) {
-      let r = Math.random() * options.reduce((sum, [w]) => sum + w, 0);
-      let i = 0;
-      while (i < options.length - 1 && (r -= options[i][0]) > 0) i++;
-      if (options[i][1]()) return;
-      options.splice(i, 1);
-    }
+    pickEvent(options);
+  }
+
+  /** Одно из появлений Херобрина; первое — всегда вдали, ради этого всё и затевалось. */
+  private heroEvent(): boolean {
+    if (!this.seenHim) return this.watch(this.underground) || (!this.underground && this.approach());
+    const env = this.host.env;
+    const night = env.night > 0.5;
+    const dark = 1 - Math.max((this.sky / 15) * env.daylight, this.blk / 15) > 0.65;
+    const fp = this.host.firstPerson();
+    const options: [number, () => boolean][] = [];
+    const add = (weight: number, fn: () => boolean) => {
+      if (weight > 0) options.push([weight, fn]);
+    };
+    add(this.underground ? 5 : 6, () => this.watch(this.underground));
+    add(this.underground || (night && dark) ? 3 : 0, () => this.eyes());
+    add(this.underground ? 0 : night ? 3 : 1.5, () => this.approach());
+    add(fp ? 2.5 : 0, () => this.behind());
+    add(fp ? 0.7 : 0, () => this.turnAround());
+    return pickEvent(options);
   }
 
   // ───────────────────────────── что видит игрок ─────────────────────────────
@@ -484,15 +519,19 @@ export class HorrorDirector {
   }
 
   /**
-   * Место, где Херобрин будет стоять, пока игрок не обернётся: сбоку или сзади (на экране
-   * его сейчас нет), но так, чтобы между ним и игроком ничего не было.
+   * Место, где Херобрин будет стоять, пока игрок его не увидит: сейчас его на экране нет,
+   * но между ним и игроком ничего не мешает. Чаще всего — сразу за краем экрана или прямо
+   * впереди, пока игрок смотрит под ноги: стоит чуть повернуть голову или поднять взгляд.
+   * edge — только за краем экрана.
    */
-  private findSpot(minD: number, maxD: number, cave: boolean): THREE.Vector3 | null {
+  private findSpot(minD: number, maxD: number, cave: boolean, edge = false): THREE.Vector3 | null {
     const w = this.host.world;
     const look = this.lookYaw;
     const by = Math.floor(this.host.player.y);
-    for (let i = 0; i < 40; i++) {
-      const yaw = look + (Math.random() < 0.5 ? -1 : 1) * rand(1.15, 2.7);
+    for (let i = 0; i < 48; i++) {
+      const r = edge ? 0.5 : Math.random();
+      const side = Math.random() < 0.5 ? -1 : 1;
+      const yaw = look + (r < 0.35 ? rand(-0.8, 0.8) : side * (r < 0.8 ? rand(1, 1.6) : rand(1.6, 2.7)));
       const d = rand(minD, maxD);
       const x = Math.floor(this.eye.x - Math.sin(yaw) * d);
       const z = Math.floor(this.eye.z - Math.cos(yaw) * d);
@@ -512,7 +551,7 @@ export class HorrorDirector {
 
   // ───────────────────────────── Херобрин ─────────────────────────────
 
-  private appear(kind: Kind, pos: THREE.Vector3): void {
+  private appear(kind: Kind, pos: THREE.Vector3, cave = false): void {
     this.hero = {
       kind,
       pos,
@@ -522,6 +561,8 @@ export class HorrorDirector {
       lookTime: 0,
       awayTime: 0,
       cued: false,
+      moveAt: 12,
+      cave,
       beat: 0,
       final: false,
       misses: 0,
@@ -529,7 +570,7 @@ export class HorrorDirector {
       loud: false,
     };
     this.model.group.visible = true;
-    this.nextHero = this.clock + rand(100, 170);
+    this.nextHero = this.clock + rand(60, 110) * this.pace;
     this.poseHero(0);
   }
 
@@ -546,7 +587,7 @@ export class HorrorDirector {
     const [minD, maxD] = this.distances(cave, this.host.fog()[1]);
     const spot = this.findSpot(minD, maxD, cave);
     if (!spot) return false;
-    this.appear('watch', spot);
+    this.appear('watch', spot, cave);
     return true;
   }
 
@@ -566,14 +607,31 @@ export class HorrorDirector {
     const night = this.host.env.night > 0.5;
     if (!this.underground && !night) return false;
     const spot = this.findSpot(10, this.underground ? 18 : 20, this.underground);
-    if (!spot || (this.host.world.getLight(Math.floor(spot.x), Math.floor(spot.y + 1), Math.floor(spot.z)) & 15) > 3) return false;
-    this.appear('eyes', spot);
+    if (!spot || !this.dark(spot)) return false;
+    this.appear('eyes', spot, this.underground);
     return true;
   }
 
-  /** Стоит в паре шагов за спиной и дышит. */
-  private behind(): boolean {
-    if (this.hero || !this.host.firstPerson()) return false;
+  /** Факелов рядом нет — глаза светятся в темноте. */
+  private dark(feet: THREE.Vector3): boolean {
+    return (this.host.world.getLight(Math.floor(feet.x), Math.floor(feet.y + 1), Math.floor(feet.z)) & 15) <= 3;
+  }
+
+  /** Игрок его не замечает — переходит туда, где его увидят, стоит чуть повернуть голову. */
+  private reposition(a: Appearance): void {
+    let spot: THREE.Vector3 | null;
+    if (a.kind === 'eyes') {
+      spot = this.findSpot(10, a.cave ? 18 : 20, a.cave, true);
+      if (spot && !this.dark(spot)) spot = null;
+    } else {
+      const [minD, maxD] = this.distances(a.cave, this.host.fog()[1]);
+      spot = this.findSpot(a.kind === 'approach' ? maxD * 0.75 : minD, maxD, a.cave, true);
+    }
+    if (spot) a.pos.copy(spot);
+  }
+
+  /** Место в паре шагов за спиной: обернёшься — и увидишь его. */
+  private behindSpot(): THREE.Vector3 | null {
     const look = this.lookYaw;
     const by = Math.floor(this.host.player.y);
     for (let i = 0; i < 20; i++) {
@@ -584,13 +642,20 @@ export class HorrorDirector {
       const y = this.floorNear(x, by, z, 1, 1);
       if (y === null) continue;
       const spot = new THREE.Vector3(x + 0.5, y, z + 0.5);
-      if (this.hidden(spot)) continue;
-      const head = this.head(spot);
-      this.appear('behind', spot);
-      this.play('horror_breath', { x: head.x, y: head.y, z: head.z, volume: 1.5 });
-      return true;
+      if (!this.hidden(spot)) return spot;
     }
-    return false;
+    return null;
+  }
+
+  /** Стоит в паре шагов за спиной и дышит. */
+  private behind(): boolean {
+    if (this.hero || !this.host.firstPerson()) return false;
+    const spot = this.behindSpot();
+    if (!spot) return false;
+    const head = this.head(spot);
+    this.appear('behind', spot);
+    this.play('horror_breath', { x: head.x, y: head.y, z: head.z, volume: 1.5 });
+    return true;
   }
 
   /** Проснулся — а он стоит у кровати. */
@@ -624,7 +689,8 @@ export class HorrorDirector {
     const dist = head.distanceTo(this.eye);
     const s = this.screen(head);
     const onScreen = s !== null;
-    const central = s !== null && Math.abs(s.x) < 0.6 && Math.abs(s.y) < 0.7;
+    // Заметным считаем почти весь экран, кроме самого края: резкий звук подскажет, куда смотреть.
+    const central = s !== null && Math.abs(s.x) < 0.8 && Math.abs(s.y) < 0.8;
     const direct = s !== null && Math.abs(s.x) < 0.14 && Math.abs(s.y) < 0.2;
     a.awayTime = onScreen ? 0 : a.awayTime + dt;
     a.lookTime = direct ? a.lookTime + dt : Math.max(0, a.lookTime - dt);
@@ -698,7 +764,10 @@ export class HorrorDirector {
     }
   }
 
-  /** Игрок его ещё не заметил: ждём, подсказываем шёпотом с его стороны, потом уходит. */
+  /**
+   * Игрок его ещё не заметил: ждём; время от времени он переходит туда, где его увидят,
+   * стоит чуть повернуть голову, и шепчет с той стороны; так и не заметили — уходит.
+   */
   private unnoticed(a: Appearance, central: boolean, head: THREE.Vector3): void {
     if (central) {
       a.noticed = true;
@@ -708,11 +777,16 @@ export class HorrorDirector {
       if (a.kind !== 'eyes') this.play('horror_sting', { volume: dist > 24 ? 0.8 : 1 });
       this.play('horror_drone', { volume: 0.9 });
       this.glitchFor(0.35, 0.12);
-    } else if (a.age > 12 && !a.cued) {
-      a.cued = true;
-      const c = head.clone().sub(this.eye).setLength(6).add(this.eye);
-      this.play('horror_whisper', { x: c.x, y: c.y, z: c.z, volume: 1 });
-    } else if (a.age > 35) this.vanish(false);
+    } else if (a.age > 45) this.vanish(false);
+    else if (a.age > a.moveAt) {
+      a.moveAt = a.age + 12;
+      this.reposition(a);
+      if (!a.cued) {
+        a.cued = true;
+        const c = this.head(a.pos).sub(this.eye).setLength(6).add(this.eye);
+        this.play('horror_whisper', { x: c.x, y: c.y, z: c.z, volume: 1 });
+      }
+    }
   }
 
   /** Отвернулся — «подходящий» Херобрин уже ближе; последний шаг — вплотную. */
@@ -774,8 +848,8 @@ export class HorrorDirector {
     this.model.group.visible = false;
     this.hero = null;
     // Не заметили — попробует снова пораньше.
-    if (!a.noticed) this.nextHero = this.clock + rand(25, 45);
-    this.nextEvent = Math.max(this.nextEvent, this.clock + rand(20, 40));
+    if (!a.noticed) this.nextHero = this.clock + rand(15, 30) * this.pace;
+    this.nextEvent = Math.max(this.nextEvent, this.clock + rand(12, 25) * this.pace);
   }
 
   /** Поворачивается к игроку всем телом и смотрит в глаза; растворяется в тумане, кроме глаз. */
@@ -806,7 +880,8 @@ export class HorrorDirector {
 
   /** На экране «ОБЕРНИСЬ» — а за спиной он. */
   private turnAround(): boolean {
-    if (this.hero || !this.host.firstPerson()) return false;
+    // Надпись — только если за спиной есть где встать: обернёшься, а там он.
+    if (this.hero || !this.host.firstPerson() || !this.behindSpot()) return false;
     this.flashText('ОБЕРНИСЬ', 260);
     this.play('horror_static', { volume: 0.7 });
     this.glitchFor(0.7, 0.25);
@@ -816,7 +891,7 @@ export class HorrorDirector {
 
   /** Лицо на весь экран — редко и только ночью. */
   private faceEvent(): boolean {
-    this.nextFace = this.clock + rand(500, 800);
+    this.nextFace = this.clock + rand(300, 500) * this.pace;
     this.scare(true);
     return true;
   }
@@ -1034,7 +1109,7 @@ export class HorrorDirector {
   /** Звуки пещер и ночи. */
   private updateAmbient(): void {
     if (this.clock < this.nextAmbient) return;
-    this.nextAmbient = this.clock + rand(25, 70);
+    this.nextAmbient = this.clock + rand(20, 50) * this.pace;
     if (!this.underground && this.host.env.night < 0.5) return;
     const at = this.around(Math.random() * Math.PI * 2, rand(8, 15), rand(-3, 3));
     this.play('horror_cave', { x: at.x, y: at.y, z: at.z, volume: this.underground ? 1.6 : 1.1 });

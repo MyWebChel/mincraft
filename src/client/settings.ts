@@ -11,8 +11,8 @@ export interface Settings {
   quality: QualityLevel;
   volume: number;
   music: number;
-  /** Хоррор: Херобрин и жуткие события. */
-  horror: boolean;
+  /** Как часто Херобрин и жуткие события: 0 — выкл, 1 — иногда, 2 — часто, 3 — постоянно. */
+  horror: number;
 }
 
 const KEY = 'minecraft:settings:v3';
@@ -55,7 +55,7 @@ function defaults(): Settings {
     quality,
     volume: 80,
     music: 40,
-    horror: true,
+    horror: 2,
   };
 }
 
@@ -74,7 +74,9 @@ export function loadSettings(): Settings {
     }
     const s: Settings = { ...d, ...saved };
     if (!['low', 'medium', 'high', 'ultra'].includes(s.quality)) s.quality = d.quality;
-    if (typeof s.horror !== 'boolean') s.horror = d.horror;
+    // Раньше ужасы просто включались и выключались.
+    const horror: unknown = s.horror;
+    s.horror = horror === false ? 0 : typeof horror === 'number' && horror >= 0 && horror <= 3 ? Math.round(horror) : d.horror;
     return s;
   } catch {
     return d;
